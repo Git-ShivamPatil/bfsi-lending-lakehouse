@@ -1,0 +1,73 @@
+name: Dashboard
+
+# Regenerates the portfolio dashboard from a freshly generated book and
+# publishes it to GitHub Pages. Free for public repositories on standard
+# runners, and the dashboard is a single static file with no external requests,
+# so there is nothing to host beyond the HTML itself.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # 20k loans rather than the full 150k: the dashboard's pure-Python
+      # snapshot walk is O(loans x months), and the shapes it renders are
+      # identical either way. The headline figures in the README come from the
+      # full run.
+      - name: Generate the book
+        run: |
+          python -m generator --loans 20000 --merchants 400 --months 24 \
+            --seed 42 --as-of 2026-08-31 --out data/dash
+
+      - name: Build the dashboard
+        run: |
+          python -m docs.build_dashboard --data data/dash \
+            --as-of 2026-08-31 --out docs/index.html
+
+      - name: Fail if the page came out empty or malformed
+        run: |
+          python - <<'PY'
+          import pathlib, re
+          h = pathlib.Path("docs/index.html").read_text(encoding="utf-8")
+          assert len(h) > 20_000, f"dashboard is only {len(h)} bytes"
+          assert h.count("<rect") > 50, "bucket-mix chart has no bars"
+          assert not re.findall(r"\{[a-z_]+\}", h), "unresolved template braces"
+          assert ">None<" not in h and "nan" not in h.lower(), "null leaked into the page"
+          for tag in ("div", "table", "svg", "tr"):
+              o = len(re.findall(rf"<{tag}[ >]", h))
+              c = h.count(f"</{tag}>")
+              assert o == c, f"unbalanced <{tag}>: {o} open, {c} closed"
+          print(f"dashboard OK, {len(h):,} bytes")
+          PY
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

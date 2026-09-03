@@ -1,12 +1,32 @@
 # BFSI Lending Lakehouse
 
 A medallion-architecture lakehouse for an Indian no-cost-EMI / checkout-finance
-lender, built in PySpark on **Databricks Free Edition**, with a regulatory-grade
-gold layer and a configurable validation-rule repository modelled on how RBI
-return validation actually works.
+lender, written in PySpark for **Databricks Free Edition**, with a
+regulatory-grade gold layer and a configurable validation-rule repository
+modelled on how RBI return validation actually works.
 
 It runs at **zero cost**, on free tiers only, and every headline number below
 came out of a real run rather than an illustration.
+
+**→ [Live dashboard](https://git-shivampatil.github.io/bfsi-lending-lakehouse/)**
+— portfolio position, roll-rate matrix, vintage triangle and data-quality
+scorecard, rebuilt by CI on every push.
+
+### Where each part has actually run
+
+Being straight about this matters more than the claim it costs me:
+
+| | |
+|---|---|
+| Generator, back-test, dashboard | Verified locally **and** in CI |
+| Medallion pipeline (bronze → gold) | Verified in CI on PySpark **3.5.3 and 4.2.0** |
+| Incremental `MERGE INTO`, Delta time travel | Verified in CI (needs a Delta runtime) |
+| Databricks Free Edition | **Not yet run there.** The code targets its constraints and [`notebooks/run_pipeline.py`](notebooks/run_pipeline.py) is the runbook, but no cell of it has executed on Databricks. |
+
+The last row is the honest gap. Everything is written against Free Edition's
+documented limits — serverless-only, Spark Connect APIs, no RDDs, no Scala, no
+JARs — and nothing in the pipeline needs a feature outside them, but "targets"
+is not "has run", and the README says so until it has.
 
 ---
 
@@ -145,6 +165,39 @@ did not, which meant the rules guarding them were passing vacuously.
 
 ---
 
+## Incremental loads, and the trap inside `MERGE INTO`
+
+A lakehouse that only ever overwrites is a batch job with extra steps.
+[`pipeline/silver/upsert.py`](pipeline/silver/upsert.py) is the incremental
+path: batches append to bronze and merge into silver on a natural key.
+
+`MERGE INTO` requires at most one source row per target row. Give it a source
+with a duplicated key and Delta **refuses**:
+
+```
+Cannot perform Merge as multiple source rows matched ...
+```
+
+That is Delta refusing a non-deterministic write, and the fix is not to disable
+the check — it is to collapse duplicates with an explicit, stable ordering
+*before* merging, which is what `apply_uniqueness` does. The tests assert both
+halves: that an un-deduplicated source really does fail, and that the pipeline's
+own output really does not. Plus idempotency (replaying a batch must not change
+the table), in-place correction of restated rows, and that Delta history records
+every write.
+
+## Expected credit loss
+
+[`ECL_SQL`](pipeline/gold/metrics.py) stages the book under IND-AS 109 —
+Stage 1 (≤30 DPD, 12-month ECL), Stage 2 (31–90, lifetime), Stage 3 (90+,
+credit-impaired) — and computes a provision as EAD × PD × LGD. Tests assert the
+staging partitions the book exactly once and that coverage rises with stage.
+
+The PD and LGD inputs are **assumptions and the weakest numbers in the repo**: a
+real implementation derives PD from the observed roll-rate matrix and LGD from
+realised recoveries, neither of which this book models. The staging is real; the
+provision figure has the right shape but is not quotable.
+
 ## Correctness
 
 The Spark pipeline and [`validation/backtest.py`](validation/backtest.py)
@@ -156,10 +209,11 @@ assert spark_gnpa == pytest.approx(python_gnpa, abs=0.002)
 ```
 
 Two implementations agreeing is much stronger evidence than one implementation
-passing its own assertions. 22 tests, all green, covering determinism,
+passing its own assertions. **29 tests**, all green, covering determinism,
 amortisation reconciliation, ANSI-mode `try_cast` behaviour, rule compilation,
 quarantine correctness, snapshot reproducibility for historical dates, roll-rate
-closure, vintage monotonicity, and cross-implementation parity.
+closure, vintage monotonicity, ECL staging completeness, Delta idempotency, and
+cross-implementation parity.
 
 ---
 
@@ -172,10 +226,19 @@ python -m generator --loans 150000 --months 24 --seed 42 --as-of 2026-08-31 --ou
 python -m validation.backtest --data data/raw --as-of 2026-08-31 --strict
 ```
 
-The pipeline needs PySpark:
+The dashboard needs nothing either:
 
 ```bash
-pip install pyspark pytest && python -m pytest tests/ -q
+python -m docs.build_dashboard --data data/raw --as-of 2026-08-31 --out docs/index.html
+```
+
+The pipeline needs PySpark. The Delta tests additionally need a Hadoop runtime,
+so they skip on Windows and run on Linux:
+
+```bash
+pip install pyspark delta-spark pytest
+python -m pytest tests/ -q -m "not delta"   # everywhere
+python -m pytest tests/ -q -m delta         # Linux / CI
 ```
 
 On Databricks, run bronze → silver → snapshot → gold in order:
@@ -240,9 +303,13 @@ lending data is used, and none of it is scraped from anywhere.
 - **The cure model is memoryless.** Real accounts that have rolled twice behave
   differently from first-time delinquents; a state-dependent cure probability
   would produce a more realistic roll-rate matrix.
-- **No ECL / IND-AS 109 staging.** Stage 1/2/3 allocation and provision coverage
-  are the obvious next gold table, and the DPD stamping already carries what it
-  needs.
+- **ECL staging keys off DPD alone.** A real implementation also stages on
+  qualitative triggers — restructuring, forbearance, watch-list — and on
+  relative PD deterioration since origination, not only an absolute day count.
+- **No Default Loss Guarantee modelling.** The RBI (Digital Lending) Directions,
+  2025 cap DLG at 5% of the disbursed portfolio, but this book has no lending
+  service provider and no guarantee arrangement, so there is nothing honest to
+  compute. A constant for the cap was removed rather than given an invented use.
 - **No streaming path.** Everything is batch. A CDC feed via Debezium into a
   bronze append would be closer to how a real lender ingests.
 - **The `_corrupt_record` column is dropped after silver** rather than being

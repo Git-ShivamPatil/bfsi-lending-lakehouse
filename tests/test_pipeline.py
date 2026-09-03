@@ -216,6 +216,34 @@ def test_gold_gnpa_matches_the_independent_backtest(spark, snapshot, raw_views):
         f"{python_gnpa:.4%} -- one of the two definitions has drifted")
 
 
+def test_ecl_staging_partitions_the_book_exactly_once(spark, snapshot):
+    """Every live loan lands in exactly one IND-AS 109 stage, and the exposures
+    reconcile back to the portfolio total. A staging rule with a gap or an
+    overlap silently under- or over-provisions."""
+    G.ecl_parameters(spark).createOrReplaceTempView("ecl_parameters")
+    ecl = spark.sql(G.ECL_SQL)
+
+    latest = snapshot.filter("NOT is_written_off").agg(
+        F.sum("principal_outstanding").alias("os"),
+        F.count("*").alias("n")).collect()[0]
+
+    staged = ecl.agg(F.sum("exposure_at_default").alias("os"),
+                     F.sum("loans").alias("n")).collect()[0]
+
+    assert staged["n"] == latest["n"], "loans lost or double-counted by staging"
+    assert staged["os"] == pytest.approx(latest["os"], rel=1e-6)
+    assert set(r["ecl_stage"] for r in ecl.collect()) <= {
+        "STAGE_1", "STAGE_2", "STAGE_3"}
+
+
+def test_ecl_provision_rises_with_stage(spark, snapshot):
+    """Coverage must be monotonic across stages, or the parameters are wrong."""
+    G.ecl_parameters(spark).createOrReplaceTempView("ecl_parameters")
+    cov = {r["ecl_stage"]: r["provision_coverage"]
+           for r in spark.sql(G.ECL_SQL).collect()}
+    assert cov["STAGE_1"] < cov["STAGE_2"] < cov["STAGE_3"]
+
+
 def test_dq_scorecard_covers_every_rule_that_fired(spark, silver):
     G.rules_dim(spark).createOrReplaceTempView("rules_dim")
 

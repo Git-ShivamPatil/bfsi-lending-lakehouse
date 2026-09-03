@@ -19,7 +19,7 @@ import argparse
 import csv
 import json
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from generator import config as C
@@ -155,6 +155,39 @@ def portfolio(loans, schedule, paid, as_of: date):
         if p is not None:
             rows.append(p)
     return rows
+
+
+def month_end_snapshots(loans, schedule, paid, start: date, as_of: date):
+    """Per-loan position at every month end in the window.
+
+    The pure-Python equivalent of `silver_loan_snapshot`. Each loan is only
+    evaluated across the months it could plausibly be on the book for, which
+    keeps this proportional to loan-months rather than loans x all dates.
+    """
+    ends = []
+    d = date(start.year, start.month, 1)
+    while d <= as_of:
+        nxt = add_months_date(d, 1)
+        last = nxt - timedelta(days=1)
+        if last <= as_of:
+            ends.append(last)
+        d = nxt
+
+    for lid, loan in loans.items():
+        inst = schedule.get(lid, {})
+        if not inst:
+            continue
+        horizon = add_months_date(loan["disbursed_at"], loan["tenure"] + 12)
+        for snap in ends:
+            if snap < loan["disbursed_at"] or snap > horizon:
+                continue
+            p = position(lid, loan, inst, paid, snap)
+            if p is None:
+                continue
+            p["snapshot_date"] = snap
+            p["months_on_book"] = (snap.year - loan["disbursed_at"].year) * 12 + (
+                snap.month - loan["disbursed_at"].month)
+            yield p
 
 
 def vintage_curve(loans, schedule, paid, as_of: date, mobs=(3, 6, 9, 12),

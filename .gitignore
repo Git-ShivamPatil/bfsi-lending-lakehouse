@@ -2,6 +2,7 @@
 # of megabytes to the repo to store something `python -m generator` recreates
 # byte for byte.
 data/
+!docs/
 *.csv
 !docs/**/*.csv
 

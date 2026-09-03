@@ -246,6 +246,56 @@ FROM   per_merchant
 """
 
 # ---------------------------------------------------------------------------
+# IND-AS 109 expected credit loss
+# ---------------------------------------------------------------------------
+#
+# Staging is a pure function of DPD here, which is the simplification worth being
+# explicit about: a real implementation also stages on qualitative triggers
+# (restructuring, forbearance, watch-list) and on a relative deterioration in PD
+# since origination, not only on an absolute day count. The PD and LGD inputs are
+# assumptions -- see generator/config.py -- so the provision has the right shape
+# but the number is not quotable.
+
+ECL_SQL = """
+SELECT snapshot_date,
+       CASE
+           WHEN dpd <= 30 THEN 'STAGE_1'
+           WHEN dpd <= 90 THEN 'STAGE_2'
+           ELSE 'STAGE_3'
+       END                                                         AS ecl_stage,
+       COUNT(*)                                                    AS loans,
+       ROUND(SUM(principal_outstanding), 2)                        AS exposure_at_default,
+       MAX(p.pd)                                                   AS pd_assumed,
+       MAX(p.lgd)                                                  AS lgd_assumed,
+       ROUND(SUM(principal_outstanding) * MAX(p.pd) * MAX(p.lgd), 2)
+                                                                   AS expected_credit_loss,
+       ROUND(MAX(p.pd) * MAX(p.lgd), 5)                            AS provision_coverage
+FROM   silver_loan_snapshot s
+JOIN   ecl_parameters p
+       ON p.stage = CASE
+                        WHEN s.dpd <= 30 THEN 'STAGE_1'
+                        WHEN s.dpd <= 90 THEN 'STAGE_2'
+                        ELSE 'STAGE_3'
+                    END
+WHERE  NOT is_written_off
+GROUP  BY snapshot_date,
+          CASE WHEN dpd <= 30 THEN 'STAGE_1'
+               WHEN dpd <= 90 THEN 'STAGE_2'
+               ELSE 'STAGE_3' END
+"""
+
+
+def ecl_parameters(spark: SparkSession) -> DataFrame:
+    """PD/LGD assumptions as a table, so the provision joins to its inputs
+    instead of hard-coding them inside the SQL."""
+    from generator import config as C
+
+    rows = [(stage, float(v["pd"]), float(v["lgd"]))
+            for stage, v in C.ECL_PARAMETERS.items()]
+    return spark.createDataFrame(rows, "stage string, pd double, lgd double")
+
+
+# ---------------------------------------------------------------------------
 # data-quality scorecard
 # ---------------------------------------------------------------------------
 
@@ -280,6 +330,7 @@ def build(spark: SparkSession, layout: Layout) -> dict[str, int]:
         spark.table(layout.table("silver", entity)).createOrReplaceTempView(
             f"silver_{entity}")
     rules_dim(spark).createOrReplaceTempView("rules_dim")
+    ecl_parameters(spark).createOrReplaceTempView("ecl_parameters")
 
     tables = {
         "portfolio_summary": PORTFOLIO_SQL,
@@ -288,6 +339,7 @@ def build(spark: SparkSession, layout: Layout) -> dict[str, int]:
         "vintage": VINTAGE_SQL,
         "collection_efficiency": COLLECTION_SQL,
         "merchant_risk": MERCHANT_RISK_SQL,
+        "ecl_staging": ECL_SQL,
         "dq_scorecard": DQ_SQL,
     }
 

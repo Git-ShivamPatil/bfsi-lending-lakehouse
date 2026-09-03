@@ -63,11 +63,26 @@ DPD_BUCKETS = (
 #: Tenures Snapmint documents on its own product pages.
 TENURES_MONTHS = (3, 6, 9, 12)
 
-#: Under the RBI (Digital Lending) Directions, 2025 (issued 8 May 2025), a
-#: Default Loss Guarantee is capped at 5% of the total disbursed amount of the
-#: specified loan portfolio. The gold layer reports DLG utilisation against this
-#: cap; it is a reporting constant, not a simulation input.
-DLG_CAP_PCT = 0.05
+#: IND-AS 109 expected-credit-loss staging, keyed off days past due.
+#: Stage 1 is performing (12-month ECL); Stage 2 is a significant increase in
+#: credit risk (lifetime ECL); Stage 3 is credit-impaired, which lines up with
+#: the 90-DPD NPA threshold above.
+ECL_STAGE_DPD = (
+    ("STAGE_1", 0, 30),
+    ("STAGE_2", 31, 90),
+    ("STAGE_3", 91, 10_000),
+)
+
+#: PD and LGD by stage. **Assumed**, and the weakest numbers in this file: a real
+#: implementation derives PD from the observed roll-rate matrix and LGD from
+#: realised recoveries, neither of which this book models. They are here so the
+#: staging produces a provision figure with the right shape, not so the figure
+#: can be quoted.
+ECL_PARAMETERS = {
+    "STAGE_1": {"pd": 0.030, "lgd": 0.65},
+    "STAGE_2": {"pd": 0.280, "lgd": 0.65},
+    "STAGE_3": {"pd": 1.000, "lgd": 0.65},
+}
 
 # --------------------------------------------------------------------------
 # Modelling assumptions -- NOT sourced. Documented so a reader can disagree.
