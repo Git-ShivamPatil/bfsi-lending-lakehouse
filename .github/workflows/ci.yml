@@ -1,0 +1,98 @@
+name: CI
+
+# Free on public repositories: GitHub bills only self-hosted and larger runners,
+# and this workflow uses neither. The whole project is designed to cost nothing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generator:
+    name: Generator and calibration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The generator has no third-party dependencies at all -- proving that
+      # here is the point, so nothing is installed before this step.
+      - name: Generate a book with the standard library alone
+        run: |
+          python -m generator --loans 60000 --merchants 900 --months 24 \
+            --seed 42 --as-of 2026-08-31 --out data/raw
+
+      - name: Back-test the book against the published GNPA
+        run: python -m validation.backtest --data data/raw --as-of 2026-08-31 --strict
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generated-book
+          path: data/raw
+          retention-days: 7
+
+  pipeline:
+    name: Medallion pipeline (PySpark ${{ matrix.spark }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 4.x is what Databricks serverless runs; 3.5 is pinned as the floor the
+        # SQL is allowed to depend on, so a query that quietly needs a 4.x-only
+        # feature fails here rather than on someone else's cluster.
+        spark: ["3.5.3", "4.2.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install
+        run: pip install --quiet "pyspark==${{ matrix.spark }}" pytest
+
+      - name: Test
+        env:
+          # The runner has 4 vCPU; more shuffle partitions than that is pure
+          # scheduling overhead on a dataset this size.
+          SHUFFLE_PARTITIONS: "4"
+        run: python -m pytest tests/ -q --durations=10
+
+  lint:
+    name: Rule repository is self-consistent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check for duplicate or malformed rule ids
+        run: |
+          python - <<'PY'
+          from validation import rules as R
+
+          ids = [r.rule_id for r in R.RULES]
+          assert len(ids) == len(set(ids)), "duplicate rule ids"
+
+          for r in R.RULES:
+              assert r.description, f"{r.rule_id} has no description"
+              if r.kind == "ROW":
+                  assert r.expression, f"{r.rule_id} is a ROW rule with no expression"
+              if r.kind == "REFERENTIAL":
+                  assert r.references, f"{r.rule_id} has no references"
+              if r.kind == "UNIQUENESS":
+                  assert r.unique_key, f"{r.rule_id} has no unique key"
+
+          print(f"{len(ids)} rules across {len(R.entities())} entities: OK")
+          PY
