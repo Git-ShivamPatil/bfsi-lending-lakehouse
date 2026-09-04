@@ -6,14 +6,15 @@
 # MAGIC
 # MAGIC **Before you run this**, once per workspace:
 # MAGIC
-# MAGIC 1. Add this repo under **Workspace → Repos → Add Repo** (Git folders are
-# MAGIC    included in Free Edition).
-# MAGIC 2. Create the catalog, schema and landing volume — cell below.
-# MAGIC 3. Upload the generated CSVs into the volume. Free Edition is
-# MAGIC    serverless-only and its outbound network access is limited to an
-# MAGIC    unpublished allowlist, so the workspace **cannot pull from an external
-# MAGIC    object store**. Push into the volume instead: either the UI upload, or
-# MAGIC    `databricks fs cp` from a machine that does have network.
+# MAGIC 1. Add this repo under **Workspace → Git folders → Add Git folder**
+# MAGIC    (included in Free Edition).
+# MAGIC 2. Create the landing volume — cell below. The catalog and schema are
+# MAGIC    `workspace.default`, which Free Edition already provides.
+# MAGIC 3. Get the generated CSVs into the volume. Free Edition is serverless-only
+# MAGIC    and has no account console, so there is no way to mint the storage
+# MAGIC    credential an external location needs: the workspace **cannot read an
+# MAGIC    external S3 bucket**. Push instead — `.github/workflows/databricks.yml`
+# MAGIC    does it through the Files API, or upload by hand from Catalog Explorer.
 # MAGIC
 # MAGIC Free Edition gives one 2X-Small SQL warehouse, five concurrent job tasks
 # MAGIC and Spark Connect APIs only — no RDD APIs, no Scala, no JARs. Everything
@@ -21,15 +22,18 @@
 
 # COMMAND ----------
 
-CATALOG = "lending"
-SCHEMA = "lakehouse"
+# `workspace.default` is pre-provisioned on Free Edition. Do NOT create a
+# catalog of your own here: CREATE CATALOG has a reported failure mode on Free
+# Edition ("Metastore storage root URL does not exist. Default Storage is
+# enabled in your account..."), and there is nothing this project needs that a
+# separate catalog would give it.
+CATALOG = "workspace"
+SCHEMA = "default"
 VOLUME = "raw"
 
 REPORTING_DATE = "2026-08-31"
 WINDOW_START = "2024-09-30"
 
-spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.{VOLUME}")
 
 RAW = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"
@@ -96,7 +100,7 @@ for name, n in build_silver(spark, layout, REPORTING_DATE).items():
 # MAGIC -- What the rule repository caught, by dimension. This is the table to
 # MAGIC -- open first: an empty quarantine means the rules are not running.
 # MAGIC SELECT rule_id, COUNT(*) AS findings
-# MAGIC FROM   lending.lakehouse.silver_quarantine
+# MAGIC FROM   workspace.default.silver_quarantine
 # MAGIC GROUP  BY rule_id
 # MAGIC ORDER  BY findings DESC
 
@@ -132,8 +136,8 @@ for name, n in build_gold(spark, layout).items():
 
 # MAGIC %sql
 # MAGIC SELECT snapshot_date, live_loans, principal_outstanding,
-# MAGIC        gnpa_ratio, par_30, par_90
-# MAGIC FROM   lending.lakehouse.gold_portfolio_summary
+# MAGIC        gnpa_ratio_crisil_basis, gnpa_ratio_on_book, par_30, par_90
+# MAGIC FROM   workspace.default.gold_portfolio_summary
 # MAGIC ORDER  BY snapshot_date DESC
 # MAGIC LIMIT  12
 
@@ -149,8 +153,8 @@ for name, n in build_gold(spark, layout).items():
 # MAGIC        ROUND(SUM(CASE WHEN to_bucket = '61-90'   THEN roll_rate END), 4) AS to_61_90,
 # MAGIC        ROUND(SUM(CASE WHEN to_bucket = '90+'     THEN roll_rate END), 4) AS to_90_plus,
 # MAGIC        ROUND(SUM(CASE WHEN to_bucket = 'CLOSED'  THEN roll_rate END), 4) AS closed
-# MAGIC FROM   lending.lakehouse.gold_roll_rate
-# MAGIC WHERE  from_date = (SELECT MAX(from_date) FROM lending.lakehouse.gold_roll_rate)
+# MAGIC FROM   workspace.default.gold_roll_rate
+# MAGIC WHERE  from_date = (SELECT MAX(from_date) FROM workspace.default.gold_roll_rate)
 # MAGIC GROUP  BY from_bucket
 # MAGIC ORDER  BY from_bucket
 
@@ -168,6 +172,6 @@ for name, n in build_gold(spark, layout).items():
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC ALTER TABLE lending.lakehouse.silver_loan_snapshot
+# MAGIC ALTER TABLE workspace.default.silver_loan_snapshot
 # MAGIC   CLUSTER BY (snapshot_date, dpd_bucket);
-# MAGIC OPTIMIZE lending.lakehouse.silver_loan_snapshot;
+# MAGIC OPTIMIZE workspace.default.silver_loan_snapshot;

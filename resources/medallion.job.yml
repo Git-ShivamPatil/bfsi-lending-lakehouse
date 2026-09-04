@@ -1,0 +1,83 @@
+# The medallion run as a Databricks job: bronze -> silver -> snapshot -> gold,
+# in that order, with real task dependencies rather than four notebooks someone
+# remembers to run in sequence.
+#
+# Free Edition allows five concurrent job tasks; this job has four and they are
+# serialised by `depends_on` anyway, so it fits with room to spare.
+#
+# Note what is NOT here: no `job_clusters`, no `new_cluster`, no `libraries`
+# with Maven coordinates or JARs. Each task names an `environment_key` instead,
+# which is how serverless compute takes its dependencies. The environment
+# deliberately installs nothing -- the pipeline is pure PySpark and the
+# generator is pure standard library, and the serverless docs are explicit that
+# installing PySpark, or anything that depends on it, terminates the session.
+#
+# Every task runs `jobs/run_stage.py`, not the pipeline module directly: a
+# spark_python_task executes a file rather than a module, and the pipeline's
+# relative imports need the repo root on sys.path first. See that file.
+
+resources:
+  jobs:
+    medallion:
+      name: "BFSI lending lakehouse -- medallion run"
+
+      # A failure in silver must not leave gold reporting yesterday's numbers as
+      # though they were today's, so runs do not overlap.
+      max_concurrent_runs: 1
+
+      environments:
+        - environment_key: default
+          spec:
+            # Environment version pins the Spark Connect client API. v4 and
+            # above have ANSI mode on by default, which is what the local test
+            # suite runs with -- pinning below that would make `try_cast`
+            # behaviour diverge between CI and Databricks.
+            environment_version: "4"
+
+      tasks:
+        - task_key: bronze
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/run_stage.py
+            parameters:
+              - "--stage=bronze"
+              - "--catalog=${var.catalog}"
+              - "--schema=${var.schema}"
+              - "--reporting-date=${var.reporting_date}"
+              - "--generator-version=1.0.0"
+
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/run_stage.py
+            parameters:
+              - "--stage=silver"
+              - "--catalog=${var.catalog}"
+              - "--schema=${var.schema}"
+              - "--reporting-date=${var.reporting_date}"
+
+        - task_key: snapshot
+          depends_on:
+            - task_key: silver
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/run_stage.py
+            parameters:
+              - "--stage=snapshot"
+              - "--catalog=${var.catalog}"
+              - "--schema=${var.schema}"
+              - "--window-start=${var.window_start}"
+              - "--reporting-date=${var.reporting_date}"
+
+        - task_key: gold
+          depends_on:
+            - task_key: snapshot
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/run_stage.py
+            parameters:
+              - "--stage=gold"
+              - "--catalog=${var.catalog}"
+              - "--schema=${var.schema}"

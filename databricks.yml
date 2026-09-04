@@ -1,0 +1,44 @@
+# Declarative Automation Bundle -- the deployment unit for this project.
+#
+# "Declarative Automation Bundles" is the current name; the docs still carry
+# "formerly known as Databricks Asset Bundles", and the CLI verb is still
+# `databricks bundle`. Minimum CLI v0.218.0.
+#
+# Everything here is shaped by Databricks Free Edition being serverless-only:
+#
+#   * no `job_clusters:` block and no `new_cluster:` on any task -- defining one
+#     is the single fastest way to make this bundle undeployable there;
+#   * an `environments:` block instead, which is how a serverless task declares
+#     its Python dependencies;
+#   * `workspace.default` rather than a catalog of our own, because CREATE
+#     CATALOG has a reported failure mode on Free Edition.
+#
+# The host and token come from DATABRICKS_HOST / DATABRICKS_TOKEN in the
+# environment, so nothing secret is committed. Free Edition has no account
+# console, which means no service principals and no OAuth M2M -- a personal
+# access token is the only auth path that works.
+
+bundle:
+  name: bfsi-lending-lakehouse
+
+variables:
+  catalog:
+    description: Unity Catalog catalog. Free Edition pre-provisions `workspace`.
+    default: workspace
+  schema:
+    description: Schema inside the catalog.
+    default: default
+  reporting_date:
+    description: The date the day-end process is run *for*.
+    default: "2026-08-31"
+  window_start:
+    description: First month end to stamp a snapshot for.
+    default: "2024-09-30"
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true

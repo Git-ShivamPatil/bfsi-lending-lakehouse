@@ -24,15 +24,25 @@ from pyspark.sql import SparkSession
 
 @dataclass(frozen=True)
 class Layout:
-    """Where tables live, and in what format."""
+    """Where tables live, and in what format.
 
-    catalog: str = "lending"
-    schema: str = "lakehouse"
+    The catalog and schema default to `workspace.default`, which Free Edition
+    pre-provisions, rather than to a catalog of our own. That is not a style
+    choice: creating a new catalog on Free Edition has a reported failure --
+    "Metastore storage root URL does not exist. Default Storage is enabled in
+    your account..." -- and a runbook whose first cell fails is worse than one
+    that uses the catalog that is already there.
+    """
+
+    catalog: str = "workspace"
+    schema: str = "default"
     fmt: str = "delta"
     #: Unity Catalog volume that GitHub Actions pushes raw extracts into.
-    #: Free Edition cannot reach an external object store, so the landing zone
-    #: is a managed volume and CI does the fetching.
-    raw_volume: str = "/Volumes/lending/lakehouse/raw"
+    #: Free Edition cannot reach an external object store -- there is no account
+    #: console, so there is no way to mint the storage credential an external
+    #: location needs -- so the landing zone is a managed volume and CI does the
+    #: fetching. See .github/workflows/databricks.yml.
+    raw_volume: str = "/Volumes/workspace/default/raw"
     qualified: bool = True
 
     def table(self, layer: str, name: str) -> str:

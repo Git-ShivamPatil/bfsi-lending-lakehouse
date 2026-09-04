@@ -91,6 +91,26 @@ jobs:
       - name: Test the incremental path
         run: python -m pytest tests/ -q -m delta --durations=10
 
+  bundle:
+    name: Bundle is deployable-shaped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: databricks/setup-cli@v0.9.0
+
+      # `databricks bundle validate` needs workspace credentials, which a public
+      # CI run has none of. The CLI will however print its own JSON schema
+      # offline, so the bundle can still be checked here on every push -- for
+      # free, with no account -- against the same schema the CLI would use.
+      - name: Install
+        run: pip install --quiet pyyaml jsonschema
+
+      - name: Validate the bundle offline
+        run: python -m tools.validate_bundle
+
   lint:
     name: Rule repository is self-consistent
     runs-on: ubuntu-latest

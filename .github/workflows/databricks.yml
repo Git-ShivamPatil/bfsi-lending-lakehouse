@@ -1,0 +1,130 @@
+name: Databricks
+
+# The landing zone, automated. Databricks Free Edition is serverless-only and
+# has no account console, so there is no way to mint the storage credential that
+# a Unity Catalog external location needs -- the workspace cannot read an S3
+# bucket. The data has to be *pushed*, and this is the push.
+#
+# Manual only. It is never triggered on push, for two reasons: Free Edition has
+# a daily compute quota that a chatty CI job would burn through, and a portfolio
+# repo should not silently depend on a workspace that may be deleted after
+# inactivity.
+#
+# Required repository secrets:
+#   DATABRICKS_HOST   e.g. https://dbc-xxxxxxxx-xxxx.cloud.databricks.com
+#   DATABRICKS_TOKEN  a personal access token from
+#                     Settings -> Developer -> Access tokens
+#
+# Free Edition has no service principals and no OAuth M2M -- a PAT is the only
+# auth path that works. Without the secrets this workflow reports what is
+# missing and exits green, so a fork is not left with a permanently red badge.
+
+on:
+  workflow_dispatch:
+    inputs:
+      loans:
+        description: Number of loans to generate
+        default: "150000"
+        type: string
+      reporting_date:
+        description: Date the day-end process is run for (YYYY-MM-DD)
+        default: "2026-08-31"
+        type: string
+      run_job:
+        description: Deploy the bundle and run the medallion job after pushing
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  push:
+    name: Push the book into Unity Catalog
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      CATALOG: workspace
+      SCHEMA: default
+      VOLUME: raw
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Are the workspace credentials configured?
+        id: creds
+        run: |
+          if [ -z "$DATABRICKS_HOST" ] || [ -z "$DATABRICKS_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DATABRICKS_HOST / DATABRICKS_TOKEN are not set."
+            echo "::notice::Add them under Settings -> Secrets and variables -> Actions to enable this workflow."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v6
+        if: steps.creds.outputs.configured == 'true'
+        with:
+          python-version: "3.11"
+
+      # No pip install: the generator is pure standard library, which is the
+      # whole reason it can also run on a Databricks driver with nothing
+      # installed.
+      - name: Generate the book
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          python -m generator \
+            --loans "${{ inputs.loans }}" \
+            --merchants 1400 --months 24 --seed 42 \
+            --as-of "${{ inputs.reporting_date }}" \
+            --out data/raw
+          du -sh data/raw
+
+      - name: Back-test before pushing anything
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          python -m validation.backtest --data data/raw \
+            --as-of "${{ inputs.reporting_date }}" --strict
+
+      - uses: databricks/setup-cli@v0.9.0
+        if: steps.creds.outputs.configured == 'true'
+
+      - name: Create the landing volume if it is not there
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          # Idempotent by tolerance rather than by flag: the CLI has no
+          # --if-not-exists here, and an existing volume is the normal case.
+          databricks volumes create "$CATALOG" "$SCHEMA" "$VOLUME" MANAGED \
+            || echo "volume already exists, continuing"
+
+      - name: Push the extracts through the Files API
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          # The fs command group requires the dbfs:/Volumes/... prefix even
+          # though this is a Unity Catalog volume and not DBFS.
+          databricks fs cp -r --overwrite \
+            data/raw "dbfs:/Volumes/$CATALOG/$SCHEMA/$VOLUME"
+          echo "--- landing zone now holds ---"
+          databricks fs ls "dbfs:/Volumes/$CATALOG/$SCHEMA/$VOLUME"
+
+      - name: Validate the bundle
+        if: steps.creds.outputs.configured == 'true'
+        run: databricks bundle validate -t dev
+
+      - name: Deploy and run the medallion job
+        if: steps.creds.outputs.configured == 'true' && inputs.run_job
+        run: |
+          databricks bundle deploy -t dev
+          databricks bundle run medallion -t dev
+
+      - name: Read the gold layer back
+        if: steps.creds.outputs.configured == 'true' && inputs.run_job
+        run: |
+          # Proof the run actually produced numbers, in the job log rather than
+          # only in a screenshot.
+          databricks api post /api/2.0/sql/statements \
+            --json "{
+              \"warehouse_id\": \"${{ secrets.DATABRICKS_WAREHOUSE_ID }}\",
+              \"statement\": \"SELECT snapshot_date, live_loans, gnpa_ratio_crisil_basis, gnpa_ratio_on_book FROM $CATALOG.$SCHEMA.gold_portfolio_summary ORDER BY snapshot_date DESC LIMIT 5\",
+              \"wait_timeout\": \"30s\"
+            }" || echo "::warning::Set DATABRICKS_WAREHOUSE_ID to read results back here."
