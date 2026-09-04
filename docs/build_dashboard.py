@@ -161,16 +161,24 @@ def build_metrics(data: Path, as_of: date):
         tot = total_month[month] or 1.0
         mix_series.append((month, {b: v / tot for b, v in by_month[month].items()}))
 
-    # roll rates: bucket now vs bucket next month, per loan
+    # roll rates: bucket now vs bucket next month, per loan.
+    # Written-off and closed are tracked separately -- a write-off is a loss and
+    # a closure is a full repayment, and reporting the first as the second
+    # flatters the cure rate. Mirrors ROLL_RATE_SQL in pipeline/gold/metrics.py.
     per_loan = defaultdict(dict)
     for s in snaps:
-        per_loan[s["loan_id"]][s["snapshot_date"].isoformat()[:7]] = s["bucket"]
+        per_loan[s["loan_id"]][s["snapshot_date"].isoformat()[:7]] = (
+            "WRITTEN_OFF" if s["written_off"] else s["bucket"])
 
     months = sorted(total_month)
     idx = {m: i for i, m in enumerate(months)}
     roll = defaultdict(lambda: defaultdict(int))
     for _lid, seq in per_loan.items():
         for m, bucket in seq.items():
+            # An account that has already been written off has left the book and
+            # cannot roll anywhere, so it is never an origin.
+            if bucket == "WRITTEN_OFF":
+                continue
             i = idx.get(m)
             if i is None or i + 1 >= len(months):
                 continue
@@ -258,8 +266,13 @@ def render(summary, mix_series, roll_rates, vintage, manifest, as_of) -> str:
     tiles = [
         ("Principal outstanding", crore(summary["principal_outstanding"]),
          f"{summary['open_loans']:,} live loans"),
-        ("GNPA", pct(summary["gnpa_pct"]),
-         f"target {C.TARGET_GNPA:.1%} ±{C.GNPA_TOLERANCE:.1%}"),
+        # The CRISIL-basis measure, because that is the basis the published
+        # target is stated on. The on-book measure gets its own tile rather than
+        # being quietly dropped -- the gap between the two is worth showing.
+        ("GNPA", pct(summary["gnpa_pct_crisil_basis"]),
+         f"90+ incl. 12m write-offs · target {C.TARGET_GNPA:.1%}"),
+        ("GNPA on book", pct(summary["gnpa_pct_on_book"]),
+         "90+ on surviving advances"),
         # PAR-30 is portfolio at risk beyond 30 days, so 1-30 DPD is excluded as
         # well as CURRENT. Summing everything that is not CURRENT would report
         # PAR-0 under a PAR-30 label.
@@ -282,7 +295,7 @@ def render(summary, mix_series, roll_rates, vintage, manifest, as_of) -> str:
         for b in BUCKET_ORDER)
 
     # roll-rate matrix
-    dests = BUCKET_ORDER + ["CLOSED"]
+    dests = BUCKET_ORDER + ["WRITTEN_OFF", "CLOSED"]
     rr = ['<div class="scroll"><table><tr><th>From \\ to</th>'
           + "".join(f"<th>{d}</th>" for d in dests) + "</tr>"]
     for frm in BUCKET_ORDER:
@@ -347,8 +360,10 @@ earlier months.</p></div>
 <h2>Roll-rate matrix</h2>
 <div class="card">{''.join(rr)}
 <p class="note">Where accounts in each bucket at month end were a month later.
-<code>CLOSED</code> is a loan that left the book rather than rolling — folding
-those into <code>CURRENT</code> would flatter the cure rate.</p></div>
+<code>CLOSED</code> is a loan repaid in full; <code>WRITTEN_OFF</code> is one
+that crossed {C.WRITE_OFF_DPD} DPD and was taken as a loss. Those are opposite
+outcomes, so they are counted apart — and folding either into
+<code>CURRENT</code> would flatter the cure rate.</p></div>
 
 <h2>Vintage: ever 30+ DPD by months on book</h2>
 <div class="card">{''.join(vt)}

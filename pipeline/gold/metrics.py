@@ -21,27 +21,55 @@ from ..common import Layout, get_spark, write_table
 # portfolio position
 # ---------------------------------------------------------------------------
 
+#
+# Two GNPA ratios, on purpose. `gnpa_ratio_on_book` is 90+ DPD over advances
+# still on the balance sheet -- the measure a pipeline reaches for by default.
+# `gnpa_ratio_crisil_basis` adds the trailing twelve months of written-off
+# principal to *both* sides, which is how CRISIL states Snapmint's 2.0%: "90+
+# dpd including last 12 months' write-offs".
+#
+# They are not close. On the shipped book they read 1.8% and 5.6%, and quoting
+# the first against a target published on the second is the kind of mismatch a
+# credit analyst catches in one question. Emitting both, and naming which is
+# which, is cheaper than being wrong.
+
 PORTFOLIO_SQL = """
+WITH agg AS (
+    SELECT snapshot_date,
+           COUNT_IF(NOT is_written_off)                              AS live_loans,
+           SUM(CASE WHEN NOT is_written_off
+                    THEN principal_outstanding ELSE 0 END)           AS os_on_book,
+           SUM(CASE WHEN NOT is_written_off AND dpd > 90
+                    THEN principal_outstanding ELSE 0 END)           AS npa_on_book,
+           SUM(CASE WHEN NOT is_written_off AND dpd > 30
+                    THEN principal_outstanding ELSE 0 END)           AS par30_on_book,
+           SUM(CASE WHEN NOT is_written_off AND dpd > 60
+                    THEN principal_outstanding ELSE 0 END)           AS par60_on_book,
+           -- Written off within the trailing year of this snapshot date.
+           SUM(CASE WHEN is_written_off
+                     AND DATEDIFF(snapshot_date, written_off_at) <= {lookback}
+                    THEN principal_outstanding ELSE 0 END)           AS wo_in_window,
+           COUNT_IF(is_written_off
+                    AND DATEDIFF(snapshot_date, written_off_at) <= {lookback})
+                                                                     AS wo_loans_in_window,
+           AVG(CASE WHEN NOT is_written_off THEN principal END)      AS avg_ticket_size
+    FROM   silver_loan_snapshot
+    GROUP  BY snapshot_date
+)
 SELECT snapshot_date,
-       COUNT(*)                                                  AS live_loans,
-       ROUND(SUM(principal_outstanding), 2)                      AS principal_outstanding,
-       ROUND(SUM(CASE WHEN dpd > 90 THEN principal_outstanding END), 2)
-                                                                 AS npa_outstanding,
-       -- GNPA is measured on advances still on the book, so written-off
-       -- accounts are excluded from both numerator and denominator; counting
-       -- them would double-recognise a loss already taken.
-       ROUND(SUM(CASE WHEN dpd > 90 THEN principal_outstanding END)
-             / NULLIF(SUM(principal_outstanding), 0), 5)         AS gnpa_ratio,
-       ROUND(SUM(CASE WHEN dpd > 30 THEN principal_outstanding END)
-             / NULLIF(SUM(principal_outstanding), 0), 5)         AS par_30,
-       ROUND(SUM(CASE WHEN dpd > 60 THEN principal_outstanding END)
-             / NULLIF(SUM(principal_outstanding), 0), 5)         AS par_60,
-       ROUND(SUM(CASE WHEN dpd > 90 THEN principal_outstanding END)
-             / NULLIF(SUM(principal_outstanding), 0), 5)         AS par_90,
-       ROUND(AVG(principal), 2)                                  AS avg_ticket_size
-FROM   silver_loan_snapshot
-WHERE  NOT is_written_off
-GROUP  BY snapshot_date
+       live_loans,
+       ROUND(os_on_book, 2)                                          AS principal_outstanding,
+       ROUND(npa_on_book, 2)                                         AS npa_outstanding,
+       wo_loans_in_window,
+       ROUND(wo_in_window, 2)                                        AS write_off_principal_in_window,
+       ROUND((npa_on_book + wo_in_window)
+             / NULLIF(os_on_book + wo_in_window, 0), 5)              AS gnpa_ratio_crisil_basis,
+       ROUND(npa_on_book / NULLIF(os_on_book, 0), 5)                 AS gnpa_ratio_on_book,
+       ROUND(par30_on_book / NULLIF(os_on_book, 0), 5)               AS par_30,
+       ROUND(par60_on_book / NULLIF(os_on_book, 0), 5)               AS par_60,
+       ROUND(npa_on_book / NULLIF(os_on_book, 0), 5)                 AS par_90,
+       ROUND(avg_ticket_size, 2)                                     AS avg_ticket_size
+FROM   agg
 ORDER  BY snapshot_date
 """
 
@@ -72,34 +100,51 @@ GROUP  BY snapshot_date, dpd_bucket, asset_classification
 
 ROLL_RATE_SQL = """
 WITH month_end AS (
-    SELECT loan_id, snapshot_date, dpd_bucket, principal_outstanding
+    SELECT loan_id, snapshot_date, dpd_bucket, principal_outstanding, is_written_off
     FROM   silver_loan_snapshot
     WHERE  snapshot_date = last_day(snapshot_date)
-      AND  NOT is_written_off
 ),
 transitions AS (
     SELECT loan_id,
            snapshot_date                                            AS from_date,
            dpd_bucket                                               AS from_bucket,
            principal_outstanding,
-           LEAD(dpd_bucket)    OVER w                               AS to_bucket,
-           LEAD(snapshot_date) OVER w                               AS to_date
+           is_written_off                                           AS from_written_off,
+           LEAD(dpd_bucket)     OVER w                              AS to_bucket,
+           LEAD(is_written_off) OVER w                              AS to_written_off,
+           LEAD(snapshot_date)  OVER w                              AS to_date
     FROM   month_end
     WINDOW w AS (PARTITION BY loan_id ORDER BY snapshot_date)
 )
 SELECT from_date,
        from_bucket,
-       -- A loan with no following snapshot has closed: it left the book rather
-       -- than rolling anywhere, and lumping it in with 'CURRENT' would flatter
-       -- the cure rate.
-       COALESCE(to_bucket, 'CLOSED')                                AS to_bucket,
+       -- Three ways to leave, and they are not the same event:
+       --   WRITTEN_OFF -- the account crossed the write-off threshold. A loss.
+       --   CLOSED      -- no following snapshot at all, so the loan was repaid
+       --                  in full and left the book. A good outcome.
+       --   a bucket    -- it rolled, cured, or stayed put.
+       -- Collapsing the first two into 'CLOSED' reports a write-off as though
+       -- it were a successful payoff, which flatters the cure rate and hides
+       -- exactly the number a credit committee is looking for.
+       CASE WHEN to_written_off      THEN 'WRITTEN_OFF'
+            WHEN to_bucket IS NULL   THEN 'CLOSED'
+            ELSE to_bucket
+       END                                                          AS to_bucket,
        COUNT(*)                                                     AS loans,
        ROUND(SUM(principal_outstanding), 2)                         AS principal_outstanding,
        ROUND(COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY from_date, from_bucket), 5)
                                                                     AS roll_rate
 FROM   transitions
-WHERE  to_date IS NULL OR months_between(to_date, from_date) BETWEEN 0.9 AND 1.1
-GROUP  BY from_date, from_bucket, COALESCE(to_bucket, 'CLOSED')
+-- The origin has to be a live account: an already-written-off loan has left the
+-- book and cannot roll anywhere.
+WHERE  NOT from_written_off
+  AND  (to_date IS NULL OR months_between(to_date, from_date) BETWEEN 0.9 AND 1.1)
+GROUP  BY from_date,
+          from_bucket,
+          CASE WHEN to_written_off    THEN 'WRITTEN_OFF'
+               WHEN to_bucket IS NULL THEN 'CLOSED'
+               ELSE to_bucket
+          END
 """
 
 # ---------------------------------------------------------------------------
@@ -332,8 +377,11 @@ def build(spark: SparkSession, layout: Layout) -> dict[str, int]:
     rules_dim(spark).createOrReplaceTempView("rules_dim")
     ecl_parameters(spark).createOrReplaceTempView("ecl_parameters")
 
+    from generator import config as C
+
     tables = {
-        "portfolio_summary": PORTFOLIO_SQL,
+        "portfolio_summary": PORTFOLIO_SQL.format(
+            lookback=C.GNPA_WRITE_OFF_LOOKBACK_DAYS),
         "bucket_mix": BUCKET_MIX_SQL,
         "roll_rate": ROLL_RATE_SQL,
         "vintage": VINTAGE_SQL,
