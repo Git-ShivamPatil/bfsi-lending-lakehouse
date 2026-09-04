@@ -41,32 +41,41 @@ gold.
 
 | | |
 |---|---|
-| Bronze rows landed | 1,400 · 105,000 · 150,000 · 1,124,484 · **810,475** |
-| Gold tables built | 8 — portfolio 24, bucket mix 113, roll rate 373, vintage 300, collections 36, merchant risk 1,400, ECL staging 68, DQ scorecard 9 |
-| GNPA at 2026-08-31, CRISIL basis | **1.907%** |
-| GNPA at 2026-08-31, on the surviving book | **0.733%** |
-| Live loans / principal outstanding | 62,503 · ₹53.62 crore |
+| Bronze rows landed | 1,400 · 105,000 · 150,000 · 1,124,484 · **820,274** |
+| Gold tables built | 8 — portfolio 24, bucket mix 113, roll rate 430, vintage 300, collections 36, merchant risk 1,400, ECL staging 68, DQ scorecard 9 |
+| GNPA at 2026-08-31 | **1.842%** — against **1.838%** from the independent Python back-test |
+| PAR-30 | 3.512% |
+| Live loans / principal outstanding | 62,921 · ₹13.09 crore |
 
-The bronze count reconciles exactly, which is the check worth making: the
-generator emitted 807,166 repayment attempts and deliberately injected 3,309
-duplicate keys, and 807,166 + 3,309 = 810,475. The quarantine reconciles the
-same way — 3,309 findings for the duplicate-key rule, 2,980 for the EMI
-reconciliation break, 305 for out-of-domain bureau scores, each equal to the
-number injected.
+**Two reconciliations worth more than the run itself.** The bronze count is
+exact: the generator emitted 816,928 repayment attempts and deliberately
+injected 3,346 duplicate keys, and 816,928 + 3,346 = 820,274. The quarantine
+reconciles the same way, rule by rule, against the number of defects injected.
 
-**Two things that had to be fixed before any of it ran**, both invisible to CI
-because CI runs open-source Spark on a local master where both work:
+And the GNPA computed by Spark on Databricks lands **0.4 bp** from the one
+computed by a few hundred lines of pure Python over the same CSVs on a laptop.
+Two implementations, two languages, two machines, one definition.
+
+**Three things broke on the way**, none of which CI could have caught, because
+CI runs open-source Spark on a local master where all three work:
 
 - `clean.py` cached the cleaned frame. The DataFrame and SQL caching APIs raise
-  on serverless compute, which is all Free Edition has.
+  on serverless compute, which is all Free Edition has — so the pipeline as
+  written could not have completed there at all.
 - `ingest.py` stamped lineage with `input_file_name()`, removed in DBR 17.3 LTS.
   The supported replacement is the hidden `_metadata` column.
+- The second run failed at gold with `[DELTA_METADATA_MISMATCH]`, because
+  Delta's `mode("overwrite")` replaces data and keeps schema, and the portfolio
+  summary had just changed shape. A full-refresh table now sets
+  `overwriteSchema`; the incremental path deliberately does not, because a merge
+  wants additive evolution and replacing a schema you meant to evolve drops
+  columns.
 
 **What is still not proven.** The bundle in [`databricks.yml`](databricks.yml)
 has never been deployed — it is checked against the CLI's own JSON schema on
 every push, which catches a malformed task or a cluster block serverless would
-reject, but schema-valid is not deployable. The run above was driven from a Git
-folder and a notebook, not from `databricks bundle deploy`.
+reject, but schema-valid is not deployable. The runs above were driven from a
+Git folder and a notebook, not from `databricks bundle deploy`.
 
 ---
 
