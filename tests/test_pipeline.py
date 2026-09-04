@@ -200,20 +200,40 @@ def test_vintage_curve_is_monotonic_within_every_cohort(spark, snapshot):
 
 
 def test_gold_gnpa_matches_the_independent_backtest(spark, snapshot, raw_views):
-    """Two implementations, one definition. They have to agree.
+    """Two implementations, two definitions, four numbers that have to agree.
 
     The Spark path goes bronze -> rules -> snapshot -> gold SQL. The backtest is
     a few hundred lines of pure Python over the same CSVs. Agreement to within a
     few basis points is the strongest evidence either of them is right.
-    """
-    spark_gnpa = (spark.sql(G.PORTFOLIO_SQL)
-                  .filter(f"snapshot_date = DATE'{REPORTING_DATE}'")
-                  .collect()[0]["gnpa_ratio"])
-    python_gnpa = report(raw_views, date.fromisoformat(REPORTING_DATE))["gnpa_pct"]
 
-    assert spark_gnpa == pytest.approx(python_gnpa, abs=0.002), (
-        f"Spark says GNPA {spark_gnpa:.4%}, the independent backtest says "
-        f"{python_gnpa:.4%} -- one of the two definitions has drifted")
+    Both GNPA measures are checked. The write-off-inclusive one is the harder of
+    the two to get right, because it depends on reconstructing *when* each
+    account was written off, and the two implementations derive that date by
+    different routes -- SQL `DATE_ADD` off the arrears anchor on one side,
+    `timedelta` arithmetic off the observed DPD on the other.
+    """
+    import generator.config as C
+
+    row = (spark.sql(G.PORTFOLIO_SQL.format(
+                lookback=C.GNPA_WRITE_OFF_LOOKBACK_DAYS))
+           .filter(f"snapshot_date = DATE'{REPORTING_DATE}'")
+           .collect()[0])
+    py = report(raw_views, date.fromisoformat(REPORTING_DATE))
+
+    for spark_col, py_key, label in (
+        ("gnpa_ratio_on_book", "gnpa_pct_on_book", "90+ on the surviving book"),
+        ("gnpa_ratio_crisil_basis", "gnpa_pct_crisil_basis",
+         "90+ incl. trailing-12m write-offs"),
+    ):
+        assert row[spark_col] == pytest.approx(py[py_key], abs=0.002), (
+            f"GNPA ({label}): Spark says {row[spark_col]:.4%}, the independent "
+            f"backtest says {py[py_key]:.4%} -- the definitions have drifted")
+
+    # The two measures must not have collapsed into each other. If they have,
+    # either the write-off window stopped matching anything or `written_off_at`
+    # is null, and the parity assertions above would pass vacuously.
+    assert row["wo_loans_in_window"] > 0, "no write-offs in the GNPA window"
+    assert row["gnpa_ratio_crisil_basis"] > row["gnpa_ratio_on_book"]
 
 
 def test_ecl_staging_partitions_the_book_exactly_once(spark, snapshot):

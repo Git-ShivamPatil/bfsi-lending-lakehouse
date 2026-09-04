@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import defaultdict
 from datetime import date
 
 from generator import config as C
 from generator.generate import add_months, amortise, main as generate
-from validation.backtest import report
+from validation.backtest import load, month_end_snapshots, report
 
 
 def _rows(path):
@@ -78,30 +79,82 @@ def test_every_defect_type_fires_at_the_standard_fixture_size(tmp_path):
 
 
 def test_book_is_calibrated_to_the_published_gnpa(tmp_path):
-    """The headline calibration gate, run across seeds so it is not seed-luck."""
+    """The headline calibration gate, run across seeds so it is not seed-luck.
+
+    Gated on the CRISIL-basis measure -- 90+ DPD including the trailing twelve
+    months of write-offs -- because that is the basis the published 2.0% is
+    stated on. The on-book measure is a different number entirely and matching
+    it against this target would be meaningless.
+    """
     for seed in (42, 7, 99, 2026):
         generate(["--loans", "8000", "--merchants", "200", "--months", "24",
                   "--seed", str(seed), "--as-of", "2026-08-31",
                   "--out", str(tmp_path / str(seed))])
         out = report(tmp_path / str(seed), date(2026, 8, 31))
-        drift = abs(out["gnpa_pct"] - C.TARGET_GNPA)
+        drift = abs(out["gnpa_pct_crisil_basis"] - C.TARGET_GNPA)
         assert drift <= C.GNPA_TOLERANCE, (
-            f"seed {seed}: GNPA {out['gnpa_pct']:.3%} drifted {drift:.3%} "
-            f"from target {C.TARGET_GNPA:.3%}")
+            f"seed {seed}: GNPA {out['gnpa_pct_crisil_basis']:.3%} drifted "
+            f"{drift:.3%} from target {C.TARGET_GNPA:.3%}")
+
+
+def test_average_ticket_lands_in_the_published_range(tmp_path):
+    """The second published anchor.
+
+    CRISIL puts Snapmint's average ticket at Rs 3,500-Rs 25,000. The ticket
+    distribution's shape is an assumption, but the band it lands in is not, so
+    the shape is not free to drift.
+    """
+    generate(["--loans", "8000", "--merchants", "200", "--months", "24",
+              "--seed", "42", "--as-of", "2026-08-31", "--out", str(tmp_path)])
+    ats = report(tmp_path, date(2026, 8, 31))["avg_ticket_size"]
+    lo, hi = C.TARGET_ATS_RANGE
+    assert lo <= ats <= hi, (
+        f"average ticket Rs {ats:,.0f} is outside the published "
+        f"Rs {lo:,}-Rs {hi:,} range")
 
 
 def test_delinquency_ladder_is_monotonic(tmp_path):
     """Deeper buckets must hold less of the book than shallower ones.
 
-    A synthetic book that has more 61-90 than 1-30 is not a lending book.
+    A synthetic book that has more 61-90 than 1-30 is not a lending book:
+    accounts cure on the way down the ladder, so each deeper rung holds less.
+
+    Measured over **every month end in the window**, pooled, rather than at the
+    single as-of date. That is not a convenience -- it is what the property
+    actually claims. Once the book was recalibrated to the published GNPA it
+    became clean enough that a single date holds only a few dozen accounts per
+    bucket, and at that sample the ordering is decided by one large-ticket loan
+    landing in one bucket rather than another: seed 7 at 40,000 loans inverts
+    1-30 and 31-60 by a single basis point. Pooling gives ~24x the sample from
+    the same generated book and tests the steady state instead of one draw.
+
+    90+ is deliberately excluded. It is open-ended -- accounts accumulate there
+    until write-off at 180 DPD, while every other bucket is a 30-day window --
+    so it is expected to hold more than the rungs above it, and including it
+    would assert something false.
     """
     generate(["--loans", "8000", "--merchants", "200", "--months", "24",
               "--seed", "42", "--as-of", "2026-08-31", "--out", str(tmp_path)])
-    mix = report(tmp_path, date(2026, 8, 31))["bucket_mix_by_value"]
+
+    as_of = date(2026, 8, 31)
+    manifest = json.loads((tmp_path / "_manifest.json").read_text(encoding="utf-8"))
+    start = date.fromisoformat(manifest["window_start"])
+
+    loans, schedule, paid, _extra = load(tmp_path, as_of)
+    pooled = defaultdict(float)
+    for p in month_end_snapshots(loans, schedule, paid, start, as_of):
+        if not p["written_off"]:
+            pooled[p["bucket"]] += p["outstanding"]
+
+    total = sum(pooled.values())
+    assert total > 0
+    mix = {k: v / total for k, v in pooled.items()}
 
     assert mix["CURRENT"] > 0.90
-    assert mix.get("1-30", 0) >= mix.get("31-60", 0)
-    assert mix.get("31-60", 0) >= mix.get("61-90", 0)
+    assert mix.get("1-30", 0) >= mix.get("31-60", 0) >= mix.get("61-90", 0), (
+        f"delinquency ladder is not monotonic: "
+        f"1-30 {mix.get('1-30', 0):.5f}, 31-60 {mix.get('31-60', 0):.5f}, "
+        f"61-90 {mix.get('61-90', 0):.5f}")
 
 
 def test_vintage_curves_do_not_improve_with_age(tmp_path):

@@ -119,7 +119,15 @@ SELECT loan_id,
            ELSE 'NPA'
        END                                                 AS asset_classification,
        COALESCE(DATEDIFF(snapshot_date, oldest_unpaid_due), 0) > {write_off_dpd}
-                                                           AS is_written_off
+                                                           AS is_written_off,
+       -- The date the account crossed the write-off threshold, not the date the
+       -- job noticed. A ratio that folds in "the last twelve months of
+       -- write-offs" -- which is how CRISIL states Snapmint's GNPA -- needs to
+       -- know when each one happened, and deriving it from the arrears anchor
+       -- keeps it reproducible for a historical rerun.
+       CASE WHEN COALESCE(DATEDIFF(snapshot_date, oldest_unpaid_due), 0) > {write_off_dpd}
+            THEN DATE_ADD(oldest_unpaid_due, {write_off_dpd} + 1)
+       END                                                 AS written_off_at
 FROM   stamped
 WHERE  principal_outstanding > 0.005
 """

@@ -9,8 +9,9 @@ open first -- then fails the build if the headline number drifts.
 
 It deliberately duplicates a little of what the silver/gold layers do in PySpark.
 That redundancy is the point: if the Spark pipeline and this independent
-implementation disagree, one of them is wrong, and `tests/test_parity.py` checks
-they do not.
+implementation disagree, one of them is wrong, and
+`tests/test_pipeline.py::test_gold_gnpa_matches_the_independent_backtest` checks
+they do not -- on both GNPA definitions.
 """
 
 from __future__ import annotations
@@ -144,6 +145,18 @@ def position(lid, loan, inst, paid, as_of: date):
     }
 
 
+def written_off_on(row, as_of: date) -> date:
+    """The date an account crossed the write-off threshold.
+
+    Write-off happens on the first day past `WRITE_OFF_DPD`, so an account
+    sitting at `dpd` today crossed it `dpd - WRITE_OFF_DPD - 1` days ago. This
+    reconstruction holds because a cure resets the arrears anchor: an account
+    that is still delinquent at `dpd` has been continuously so since its oldest
+    unpaid instalment fell due.
+    """
+    return as_of - timedelta(days=row["dpd"] - C.WRITE_OFF_DPD - 1)
+
+
 def portfolio(loans, schedule, paid, as_of: date):
     """Per-loan position as at `as_of`, written-off accounts included and flagged."""
     rows = []
@@ -264,6 +277,22 @@ def report(data: Path, as_of: date) -> dict:
     npa_os = sum(r["outstanding"] for r in book
                  if r["dpd"] > C.NPA_DPD_THRESHOLD)
 
+    # CRISIL states Snapmint's GNPA as "90+ dpd including last 12 months'
+    # write-offs", so the trailing year of written-off principal is added to
+    # both sides of the ratio. Without this the project would be calibrating an
+    # on-book measure against a target published on a write-off-inclusive one --
+    # on this book those read 1.8% and 5.6%, which is the whole difference
+    # between a defensible claim and an indefensible one.
+    recent_write_offs = [
+        r for r in written_off
+        if (as_of - written_off_on(r, as_of)).days <= C.GNPA_WRITE_OFF_LOOKBACK_DAYS
+    ]
+    wo_os = sum(r["outstanding"] for r in recent_write_offs)
+    gnpa_crisil = (npa_os + wo_os) / (total_os + wo_os) if (total_os + wo_os) else 0.0
+
+    tickets = [l["principal"] for l in loans.values() if l["principal"] > 0]
+    avg_ticket = sum(tickets) / len(tickets) if tickets else 0.0
+
     # Billing by month, for collection efficiency.
     billed = defaultdict(float)
     for lid, inst in schedule.items():
@@ -285,7 +314,15 @@ def report(data: Path, as_of: date) -> dict:
         "as_of": as_of.isoformat(),
         "open_loans": len(book),
         "principal_outstanding": round(total_os, 2),
-        "gnpa_pct": round(npa_os / total_os, 5) if total_os else 0.0,
+        # The measure CRISIL publishes, and the one the build is gated on.
+        "gnpa_pct_crisil_basis": round(gnpa_crisil, 5),
+        # 90+ DPD on the surviving book. Reported alongside because it is the
+        # measure most pipelines compute, and the gap between the two is the
+        # point.
+        "gnpa_pct_on_book": round(npa_os / total_os, 5) if total_os else 0.0,
+        "write_offs_in_gnpa_window": len(recent_write_offs),
+        "write_off_principal_in_window": round(wo_os, 2),
+        "avg_ticket_size": round(avg_ticket, 2),
         "bucket_mix_by_value": {
             k: round(v / total_os, 5) for k, v in sorted(by_bucket.items())
         } if total_os else {},
@@ -314,14 +351,28 @@ def main(argv=None) -> int:
     out = report(args.data, as_of)
     print(json.dumps(out, indent=2))
 
-    drift = abs(out["gnpa_pct"] - C.TARGET_GNPA)
-    print(f"\nGNPA {out['gnpa_pct']:.3%} vs target {C.TARGET_GNPA:.3%} "
-          f"(tolerance +/-{C.GNPA_TOLERANCE:.3%}) -> drift {drift:.3%}")
+    failures = []
 
-    if args.strict and drift > C.GNPA_TOLERANCE:
-        print("FAIL: GNPA outside tolerance; recalibrate generator/config.py")
-        return 1
-    return 0
+    gnpa = out["gnpa_pct_crisil_basis"]
+    drift = abs(gnpa - C.TARGET_GNPA)
+    print(f"\nGNPA (CRISIL basis: 90+ incl. trailing-12m write-offs) "
+          f"{gnpa:.3%} vs target {C.TARGET_GNPA:.3%} "
+          f"(tolerance +/-{C.GNPA_TOLERANCE:.3%}) -> drift {drift:.3%}")
+    print(f"GNPA (90+ on the surviving book, for contrast) "
+          f"{out['gnpa_pct_on_book']:.3%}")
+    if drift > C.GNPA_TOLERANCE:
+        failures.append("GNPA outside tolerance; recalibrate generator/config.py")
+
+    lo, hi = C.TARGET_ATS_RANGE
+    ats = out["avg_ticket_size"]
+    print(f"Average ticket Rs {ats:,.0f} vs published range "
+          f"Rs {lo:,}-Rs {hi:,}")
+    if not lo <= ats <= hi:
+        failures.append(f"average ticket Rs {ats:,.0f} outside the published range")
+
+    for f in failures:
+        print(f"FAIL: {f}")
+    return 1 if (args.strict and failures) else 0
 
 
 if __name__ == "__main__":

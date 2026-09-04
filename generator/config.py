@@ -15,14 +15,27 @@ from __future__ import annotations
 # Sourced -- these have public references
 # --------------------------------------------------------------------------
 
-#: Target gross NPA at the end of the simulation window, as a share of closing
-#: principal outstanding. CRISIL Ratings' rationale for Snapmint Financial
-#: Services Pvt Ltd (16 Apr 2026) reports GNPA of 2.0% as at 31 Dec 2025 on an
-#: AUM of Rs 615 crore. The generator back-tests against this in
-#: `validation/backtest.py` and fails the build if it drifts more than
-#: GNPA_TOLERANCE away.
+#: Target gross NPA at the end of the simulation window. CRISIL Ratings'
+#: rationale for Snapmint Financial Services Pvt Ltd (16 Apr 2026) reports GNPA
+#: of 2.0% as at 31 Dec 2025 on an AUM of Rs 615 crore.
+#:
+#: **The definition matters more than the number.** CRISIL states the measure as
+#: "90+ dpd including last 12 months' write-offs" -- so the trailing twelve
+#: months of written-off principal sits in *both* the numerator and the
+#: denominator. That is not the same as 90+ DPD on the surviving book, which is
+#: the measure a naive implementation reaches for and which this project used
+#: until it was checked: on the same generated book the two read 5.6% and 1.8%
+#: respectively. Calibrating the second against a target published on the first
+#: is an apples-to-oranges comparison that a credit analyst spots immediately.
+#:
+#: `validation/backtest.py` therefore computes both, and the build is gated on
+#: the CRISIL-basis figure because that is the one the published target is
+#: stated on.
 TARGET_GNPA = 0.020
 GNPA_TOLERANCE = 0.006
+
+#: The window of write-offs CRISIL folds into the ratio, in days.
+GNPA_WRITE_OFF_LOOKBACK_DAYS = 365
 
 #: RBI SMA buckets for loans other than revolving facilities. Days-past-due
 #: ranges per the IRACP master circular and the RBI clarification of
@@ -88,14 +101,28 @@ ECL_PARAMETERS = {
 # Modelling assumptions -- NOT sourced. Documented so a reader can disagree.
 # --------------------------------------------------------------------------
 
-#: Snapmint does not publish an average ticket size, so this is assumed from the
-#: consumer-durables/no-cost-EMI segment generally: a right-skewed distribution
-#: with most tickets between Rs 3,000 and Rs 60,000. Implemented as a lognormal
-#: on the natural log of rupees.
+#: Ticket size. The *shape* is an assumption -- a lognormal on the natural log of
+#: rupees, which is the usual form for consumer-durable tickets -- but the range
+#: it has to land in is sourced: the same CRISIL rationale cited above for GNPA
+#: publishes an average ticket size of **Rs 3,500 to Rs 25,000** and a repayment
+#: period of up to one year. `TARGET_ATS_RANGE` turns that into a second
+#: calibration gate, so the distribution cannot drift away from the one public
+#: fact available about it.
+#:
+#: The ceiling is the part that was wrong for longer than it should have been.
+#: At Rs 250,000 the book carried tickets an order of magnitude above anything
+#: this lender writes; against a published maximum tenor of twelve months that
+#: is not a checkout-finance loan. Rs 60,000 keeps the tail honest and touches
+#: 0.5% of loans.
 TICKET_LOG_MEAN = 9.4          # exp(9.4) ~ Rs 12,100 median
 TICKET_LOG_SIGMA = 0.62
 TICKET_FLOOR = 1_500
-TICKET_CEILING = 250_000
+TICKET_CEILING = 60_000
+
+#: Sourced. CRISIL Ratings, Snapmint Financial Services Pvt Ltd, 16 Apr 2026:
+#: "average ticket size of Rs 3,500 to Rs 25,000". The realised mean ticket of
+#: the generated book must land inside this band or the build fails.
+TARGET_ATS_RANGE = (3_500, 25_000)
 
 #: Bureau score bands and their share of originations. Assumed. A checkout
 #: lender skews to thin-file and near-prime customers relative to a bank.
@@ -115,7 +142,16 @@ SCORE_BANDS = (
 #: NACH debit returns run materially higher than this across the industry, but
 #: most bounces on a small-ticket EMI book cure within the same cycle, so this
 #: is the hazard of *entering* delinquency, not of a single failed presentation.
-BASE_INSTALMENT_MISS_RATE = 0.0075
+#:
+#: This is the calibration lever: it is the one parameter tuned to hit
+#: TARGET_GNPA, and everything else in this file is held fixed while it moves.
+#: It was 0.0075 while the project was (wrongly) calibrating 90+-on-book against
+#: a target published on a write-off-inclusive basis. Once the measures were
+#: matched up the book turned out to be roughly three times too risky, and the
+#: hazard came down with it. The response curve is strongly sublinear -- halving
+#: the hazard does not halve GNPA, because a cleaner book also closes faster and
+#: shrinks the denominator -- so this was found by sweep, not by algebra.
+BASE_INSTALMENT_MISS_RATE = 0.0016
 
 #: Month-on-book shape for that hazard. Early-life defaults dominate a
 #: checkout-finance book: the first instalment carries mandate-registration
