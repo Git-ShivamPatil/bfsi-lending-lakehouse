@@ -27,13 +27,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 20k loans rather than the full 150k: the dashboard's pure-Python
-      # snapshot walk is O(loans x months), and the shapes it renders are
-      # identical either way. The headline figures in the README come from the
-      # full run.
+      # The same 150k configuration the README quotes. This used to build from a
+      # 20k book because the dashboard's pure-Python snapshot walk is
+      # O(loans x months) and the shapes render identically either way -- but it
+      # meant the published page and the README disagreed on every headline
+      # number, which is worse than a slower build. Two minutes on a free runner
+      # is a fair price for the two agreeing.
       - name: Generate the book
         run: |
-          python -m generator --loans 20000 --merchants 400 --months 24 \
+          python -m generator --loans 150000 --merchants 1400 --months 24 \
             --seed 42 --as-of 2026-08-31 --out data/dash
 
       - name: Build the dashboard
