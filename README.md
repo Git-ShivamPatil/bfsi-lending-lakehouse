@@ -291,6 +291,34 @@ real implementation derives PD from the observed roll-rate matrix and LGD from
 realised recoveries, neither of which this book models. The staging is real; the
 provision figure has the right shape but is not quotable.
 
+## The SQL exercises
+
+[`exercises/`](exercises/) is a set of lending analytics questions over these
+same silver tables, each built around a trap that returns a **plausible wrong
+answer** rather than an error — a query that fails loudly teaches nothing, and
+the ones worth testing are the ones that quietly report 0% first-payment
+default.
+
+Each ships three files: the answer, the naive version, and a fixture holding a
+small input plus the expected output **computed by hand**. The suite asserts
+both that the answer matches the oracle *and* that the naive version does not —
+without the second assertion there is no evidence the fixture is even big
+enough to tell them apart.
+
+| | The trap |
+|---|---|
+| GNPA and PAR by month | A conditional `SUM` over a month with no NPA is NULL, not 0, so clean months read as missing. Was live in this repo's own gold layer. |
+| Running collections | The default window frame is `RANGE`, not `ROWS`. Two payments dated the same day both report the day's closing total. |
+| First-payment default by merchant | `NOT IN` against a subquery holding one NULL returns **no rows** — a clean-looking 0% FPD across the book. |
+| Reconciling a replay | `EXCEPT` de-duplicates, so the duplicated row indicating a non-idempotent write compares equal and vanishes. |
+| Longest delinquency streak | The row-number-difference island technique welds two spells into one when a month's snapshot is *missing* rather than merely clean. |
+
+`QUALIFY` is probed for at session start rather than assumed — it is in the
+Spark 4.2 grammar and absent from 3.5, and CI runs both. The fixtures are tens
+of rows: they prove semantics, not performance, and
+[`exercises/README.md`](exercises/README.md) says so before it says anything
+else.
+
 ## Correctness
 
 The Spark pipeline and [`validation/backtest.py`](validation/backtest.py)
@@ -302,7 +330,7 @@ assert spark_gnpa == pytest.approx(python_gnpa, abs=0.002)
 ```
 
 Two implementations agreeing is much stronger evidence than one implementation
-passing its own assertions. **30 tests**, all green, covering determinism,
+passing its own assertions. **40 tests**, all green, covering determinism,
 amortisation reconciliation, ANSI-mode `try_cast` behaviour, rule compilation,
 quarantine correctness, snapshot reproducibility for historical dates, roll-rate
 closure, vintage monotonicity, ECL staging completeness, Delta idempotency, both
