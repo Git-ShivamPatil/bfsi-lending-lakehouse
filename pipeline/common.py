@@ -104,9 +104,29 @@ def write_table(df, layout: Layout, layer: str, name: str, mode: str = "overwrit
     current recommendation and is incompatible with both partitioning and
     ZORDER, and at this project's scale (single-digit GB) partitioning would
     only produce small files.
+
+    `overwriteSchema` is set for full-refresh Delta writes, and the reason is
+    worth stating because the default bit everyone at least once. Delta's
+    `mode("overwrite")` replaces the *data* and keeps the *schema*, so the first
+    run after a gold query changes shape fails with
+
+        [DELTA_METADATA_MISMATCH] A metadata mismatch was detected when writing
+        to the Delta table.
+
+    which is exactly what happened here when the portfolio summary went from two
+    GNPA columns to one. For a table whose schema is entirely defined by the
+    query that produces it, replacing the schema is the correct semantics for a
+    full refresh.
+
+    It is emphatically NOT correct for the incremental path. `upsert.py` merges
+    into silver and wants `mergeSchema` -- additive evolution -- so that a new
+    column upstream flows through without dropping the columns already there.
+    Replacing a schema you meant to evolve silently deletes data.
     """
     target = layout.table(layer, name)
     writer = df.write.format(layout.fmt).mode(mode)
+    if layout.fmt == "delta" and mode == "overwrite":
+        writer = writer.option("overwriteSchema", "true")
     if partition_by and layout.fmt != "delta":
         writer = writer.partitionBy(*partition_by)
     writer.saveAsTable(target)
