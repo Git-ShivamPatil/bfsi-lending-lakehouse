@@ -99,7 +99,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - uses: databricks/setup-cli@v0.9.0
+      - uses: databricks/setup-cli@v1.15.0
 
       # `databricks bundle validate` needs workspace credentials, which a public
       # CI run has none of. The CLI will however print its own JSON schema

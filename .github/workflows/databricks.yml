@@ -86,7 +86,7 @@ jobs:
           python -m validation.backtest --data data/raw \
             --as-of "${{ inputs.reporting_date }}" --strict
 
-      - uses: databricks/setup-cli@v0.9.0
+      - uses: databricks/setup-cli@v1.15.0
         if: steps.creds.outputs.configured == 'true'
 
       - name: Create the landing volume if it is not there
