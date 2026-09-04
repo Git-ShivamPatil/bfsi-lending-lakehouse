@@ -17,6 +17,11 @@ came out of a real run rather than an illustration.
 — portfolio position, roll-rate matrix, vintage triangle and data-quality
 scorecard, rebuilt by CI on every push.
 
+**→ [What the book actually says](docs/ANALYSIS.md)** — the analyst's read, with
+every finding labelled as a property of the portfolio, a property of the
+generator, or a fact about measurement. A pipeline that produces no conclusion
+is a pipeline nobody needed.
+
 ### Where each part has actually run
 
 Being straight about this matters more than the claim it costs me:
