@@ -73,7 +73,12 @@ def add_lineage(df: DataFrame, batch_id: str, generator_version: str) -> DataFra
     has to defend a number to a regulator six months later.
     """
     return (
-        df.withColumn("_source_file", F.input_file_name())
+        # `_metadata.file_path`, not `input_file_name()`. The latter was removed
+        # in DBR 17.3 LTS, so the old call would have failed on exactly the
+        # platform this project targets. The hidden `_metadata` column is the
+        # supported replacement and is available on any file-based read in
+        # Spark 3.3+, so it also works unchanged on the CI matrix.
+        df.withColumn("_source_file", F.col("_metadata.file_path"))
         .withColumn("_ingested_at", F.current_timestamp())
         .withColumn("_batch_id", F.lit(batch_id))
         .withColumn("_generator_version", F.lit(generator_version))

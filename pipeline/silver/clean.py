@@ -177,8 +177,20 @@ def build(spark: SparkSession, layout: Layout, reporting_date: str) -> dict[str,
         clean, bad = split(df, entity)
 
         clean = clean.drop("_corrupt_record")
-        clean_frames[entity] = clean.cache()
         write_table(clean, layout, "silver", entity)
+
+        # Read the parent back from the table that was just written, rather than
+        # caching the unmaterialised frame. Two reasons, and the second is the
+        # load-bearing one:
+        #
+        #   * a child's referential check should run against the rows that were
+        #     actually persisted, not against a plan that might still be
+        #     recomputed differently; and
+        #   * `.cache()` raises on Databricks serverless, which is all Free
+        #     Edition offers -- the DataFrame and SQL caching APIs are not
+        #     available there. Caching here would have made this pipeline
+        #     impossible to run on the one platform it is written for.
+        clean_frames[entity] = spark.table(layout.table("silver", entity))
         counts[entity] = clean_frames[entity].count()
 
         quarantines.append(
