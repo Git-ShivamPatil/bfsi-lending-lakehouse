@@ -220,20 +220,14 @@ def test_gold_gnpa_matches_the_independent_backtest(spark, snapshot, raw_views):
            .collect()[0])
     py = report(raw_views, date.fromisoformat(REPORTING_DATE))
 
-    for spark_col, py_key, label in (
-        ("gnpa_ratio_on_book", "gnpa_pct_on_book", "90+ on the surviving book"),
-        ("gnpa_ratio_crisil_basis", "gnpa_pct_crisil_basis",
-         "90+ incl. trailing-12m write-offs"),
-    ):
-        assert row[spark_col] == pytest.approx(py[py_key], abs=0.002), (
-            f"GNPA ({label}): Spark says {row[spark_col]:.4%}, the independent "
-            f"backtest says {py[py_key]:.4%} -- the definitions have drifted")
+    assert row["gnpa_ratio"] == pytest.approx(py["gnpa_pct"], abs=0.002), (
+        f"GNPA: Spark says {row['gnpa_ratio']:.4%}, the independent backtest "
+        f"says {py['gnpa_pct']:.4%} -- the definitions have drifted")
 
-    # The two measures must not have collapsed into each other. If they have,
-    # either the write-off window stopped matching anything or `written_off_at`
-    # is null, and the parity assertions above would pass vacuously.
-    assert row["wo_loans_in_window"] > 0, "no write-offs in the GNPA window"
-    assert row["gnpa_ratio_crisil_basis"] > row["gnpa_ratio_on_book"]
+    # The write-off window has to be matching something, or the write-off
+    # reconstruction could be silently returning nothing and nobody would know.
+    assert row["wo_loans_in_window"] > 0, "no write-offs in the trailing window"
+    assert row["write_off_principal_in_window"] > 0
 
 
 def test_ecl_staging_partitions_the_book_exactly_once(spark, snapshot):

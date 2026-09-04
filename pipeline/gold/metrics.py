@@ -22,16 +22,16 @@ from ..common import Layout, get_spark, write_table
 # ---------------------------------------------------------------------------
 
 #
-# Two GNPA ratios, on purpose. `gnpa_ratio_on_book` is 90+ DPD over advances
-# still on the balance sheet -- the measure a pipeline reaches for by default.
-# `gnpa_ratio_crisil_basis` adds the trailing twelve months of written-off
-# principal to *both* sides, which is how CRISIL states Snapmint's 2.0%: "90+
-# dpd including last 12 months' write-offs".
+# `gnpa_ratio` is 90+ DPD over gross advances still on the book. That is the
+# plain ratio CRISIL states for Snapmint at 2.0%, and it is what the generator
+# is calibrated to.
 #
-# They are not close. On the shipped book they read 1.8% and 5.6%, and quoting
-# the first against a target published on the second is the kind of mismatch a
-# credit analyst catches in one question. Emitting both, and naming which is
-# which, is cheaper than being wrong.
+# `write_off_principal_in_window` is emitted beside it because the same document
+# reports a *second* and quite different metric -- "90+ dpd including last 12
+# months write-offs / Disbursements" -- whose denominator is disbursements, not
+# advances. That makes it a loss rate on origination rather than a GNPA, and
+# folding write-offs into an advances denominator produces a number belonging to
+# neither ratio. This project shipped exactly that mistake for one commit.
 
 PORTFOLIO_SQL = """
 WITH agg AS (
@@ -62,9 +62,7 @@ SELECT snapshot_date,
        ROUND(npa_on_book, 2)                                         AS npa_outstanding,
        wo_loans_in_window,
        ROUND(wo_in_window, 2)                                        AS write_off_principal_in_window,
-       ROUND((npa_on_book + wo_in_window)
-             / NULLIF(os_on_book + wo_in_window, 0), 5)              AS gnpa_ratio_crisil_basis,
-       ROUND(npa_on_book / NULLIF(os_on_book, 0), 5)                 AS gnpa_ratio_on_book,
+       ROUND(npa_on_book / NULLIF(os_on_book, 0), 5)                 AS gnpa_ratio,
        ROUND(par30_on_book / NULLIF(os_on_book, 0), 5)               AS par_30,
        ROUND(par60_on_book / NULLIF(os_on_book, 0), 5)               AS par_60,
        ROUND(npa_on_book / NULLIF(os_on_book, 0), 5)                 AS par_90,

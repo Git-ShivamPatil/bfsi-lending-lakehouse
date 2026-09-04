@@ -19,23 +19,33 @@ from __future__ import annotations
 #: rationale for Snapmint Financial Services Pvt Ltd (16 Apr 2026) reports GNPA
 #: of 2.0% as at 31 Dec 2025 on an AUM of Rs 615 crore.
 #:
-#: **The definition matters more than the number.** CRISIL states the measure as
-#: "90+ dpd including last 12 months' write-offs" -- so the trailing twelve
-#: months of written-off principal sits in *both* the numerator and the
-#: denominator. That is not the same as 90+ DPD on the surviving book, which is
-#: the measure a naive implementation reaches for and which this project used
-#: until it was checked: on the same generated book the two read 5.6% and 1.8%
-#: respectively. Calibrating the second against a target published on the first
-#: is an apples-to-oranges comparison that a credit analyst spots immediately.
+#: The rationale says it plainly and without qualification: "Its GNPA improved
+#: from ~3.1% as on March 31, 2025, to ~2.0% as on December 31, 2025". That is
+#: an ordinary gross NPA ratio -- 90+ DPD over gross advances still on the book
+#: -- and it is what `gnpa_pct` is gated against.
 #:
-#: `validation/backtest.py` therefore computes both, and the build is gated on
-#: the CRISIL-basis figure because that is the one the published target is
-#: stated on.
+#: **There is a second, different ratio in the same document, and confusing the
+#: two is the trap.** CRISIL separately reports "90+ dpd including last 12
+#: months write-offs **/ Disbursements**" at 2.7% (Dec 25), 4.8% (Mar 25) and
+#: 6.3% (Mar 24). Its denominator is *disbursements for the period*, not
+#: advances, so it is a loss-rate-on-origination measure and not a GNPA at all.
+#: A reading that folds write-offs into a gross-advances denominator and matches
+#: the result to the 2.0% belongs to neither ratio; this project did exactly
+#: that for one commit and made the book roughly three times too clean before
+#: the primary source was re-read.
 TARGET_GNPA = 0.020
 GNPA_TOLERANCE = 0.006
 
-#: The window of write-offs CRISIL folds into the ratio, in days.
+#: The window of write-offs the supplementary CRISIL ratio folds in, in days.
 GNPA_WRITE_OFF_LOOKBACK_DAYS = 365
+
+#: CRISIL's supplementary ratio, reported alongside the GNPA above but *not*
+#: gated on, because its denominator convention is ambiguous from the outside:
+#: "Disbursements" for a nine-month reporting period could be the period figure
+#: or a trailing twelve months, and the two differ materially on a book growing
+#: this fast. `validation/backtest.py` computes it on a trailing-twelve-month
+#: denominator and says so. Reported for shape, not matched to a target.
+TARGET_WRITE_OFF_RATIO_ON_DISBURSEMENTS = 0.027
 
 #: RBI SMA buckets for loans other than revolving facilities. Days-past-due
 #: ranges per the IRACP master circular and the RBI clarification of
@@ -102,27 +112,35 @@ ECL_PARAMETERS = {
 # --------------------------------------------------------------------------
 
 #: Ticket size. The *shape* is an assumption -- a lognormal on the natural log of
-#: rupees, which is the usual form for consumer-durable tickets -- but the range
-#: it has to land in is sourced: the same CRISIL rationale cited above for GNPA
-#: publishes an average ticket size of **Rs 3,500 to Rs 25,000** and a repayment
-#: period of up to one year. `TARGET_ATS_RANGE` turns that into a second
-#: calibration gate, so the distribution cannot drift away from the one public
-#: fact available about it.
+#: rupees, which is the usual form for consumer-durable tickets -- but the mean
+#: it has to hit is sourced, and the sourcing needs care because the rationale
+#: contains two different ticket numbers:
 #:
-#: The ceiling is the part that was wrong for longer than it should have been.
-#: At Rs 250,000 the book carried tickets an order of magnitude above anything
-#: this lender writes; against a published maximum tenor of twelve months that
-#: is not a checkout-finance loan. Rs 60,000 keeps the tail honest and touches
-#: 0.5% of loans.
-TICKET_LOG_MEAN = 9.4          # exp(9.4) ~ Rs 12,100 median
+#:   "average ticket size ranging from Rs 3,500 to Rs 25,000"
+#:   "As of December 31, 2025, the average ticket size for the overall
+#:    portfolio was Rs 3,500."
+#:
+#: The first is a range *across products*. The second is the portfolio average,
+#: and it is the one a book-level mean has to match. Reading the range as a band
+#: the mean may sit anywhere inside lets the book run four times too large --
+#: which it did, at Rs 14,604.
+#:
+#: Arithmetic settles it independently of the wording. At Rs 3,500 the published
+#: disbursement series (Rs 634 cr FY24, Rs 1,177 cr FY25, Rs 1,760 cr 9M FY26)
+#: implies roughly 10.2 million loans, consistent with CRISIL's "15+ million
+#: transactions" since inception. At Rs 14,604 it implies 2.4 million, which
+#: cannot be reconciled with the same document.
+TICKET_LOG_MEAN = 7.97         # exp(7.97) ~ Rs 2,890 median
 TICKET_LOG_SIGMA = 0.62
-TICKET_FLOOR = 1_500
+TICKET_FLOOR = 500
 TICKET_CEILING = 60_000
 
 #: Sourced. CRISIL Ratings, Snapmint Financial Services Pvt Ltd, 16 Apr 2026:
-#: "average ticket size of Rs 3,500 to Rs 25,000". The realised mean ticket of
-#: the generated book must land inside this band or the build fails.
-TARGET_ATS_RANGE = (3_500, 25_000)
+#: the overall-portfolio average ticket at 31 Dec 2025. The realised mean ticket
+#: of the generated book is gated against this, with a tolerance wide enough to
+#: absorb the lognormal's sampling noise but not a mis-set mean.
+TARGET_ATS = 3_500
+ATS_TOLERANCE = 400
 
 #: Bureau score bands and their share of originations. Assumed. A checkout
 #: lender skews to thin-file and near-prime customers relative to a bank.
@@ -145,13 +163,12 @@ SCORE_BANDS = (
 #:
 #: This is the calibration lever: it is the one parameter tuned to hit
 #: TARGET_GNPA, and everything else in this file is held fixed while it moves.
-#: It was 0.0075 while the project was (wrongly) calibrating 90+-on-book against
-#: a target published on a write-off-inclusive basis. Once the measures were
-#: matched up the book turned out to be roughly three times too risky, and the
-#: hazard came down with it. The response curve is strongly sublinear -- halving
-#: the hazard does not halve GNPA, because a cleaner book also closes faster and
-#: shrinks the denominator -- so this was found by sweep, not by algebra.
-BASE_INSTALMENT_MISS_RATE = 0.0016
+#: It briefly went to 0.0016 while the project was matching a write-off-inclusive
+#: ratio against the plain GNPA -- two different measures, and the mistake made
+#: the book about three times too clean before the rating rationale was re-read
+#: word for word. Ticket size does not enter the hazard, so the two calibration
+#: gates are independent and can be tuned one at a time.
+BASE_INSTALMENT_MISS_RATE = 0.0075
 
 #: Month-on-book shape for that hazard. Early-life defaults dominate a
 #: checkout-finance book: the first instalment carries mandate-registration

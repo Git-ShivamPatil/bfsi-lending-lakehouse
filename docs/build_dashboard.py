@@ -266,13 +266,11 @@ def render(summary, mix_series, roll_rates, vintage, manifest, as_of) -> str:
     tiles = [
         ("Principal outstanding", crore(summary["principal_outstanding"]),
          f"{summary['open_loans']:,} live loans"),
-        # The CRISIL-basis measure, because that is the basis the published
-        # target is stated on. The on-book measure gets its own tile rather than
-        # being quietly dropped -- the gap between the two is worth showing.
-        ("GNPA", pct(summary["gnpa_pct_crisil_basis"]),
-         f"90+ incl. 12m write-offs · target {C.TARGET_GNPA:.1%}"),
-        ("GNPA on book", pct(summary["gnpa_pct_on_book"]),
-         "90+ on surviving advances"),
+        # 90+ DPD over gross advances -- the plain ratio CRISIL states at 2.0%.
+        ("GNPA", pct(summary["gnpa_pct"]),
+         f"90+ over advances · target {C.TARGET_GNPA:.1%}"),
+        ("Avg ticket", f"&#8377;{summary['avg_ticket_size']:,.0f}",
+         f"published &#8377;{C.TARGET_ATS:,}"),
         # PAR-30 is portfolio at risk beyond 30 days, so 1-30 DPD is excluded as
         # well as CURRENT. Summing everything that is not CURRENT would report
         # PAR-0 under a PAR-30 label.

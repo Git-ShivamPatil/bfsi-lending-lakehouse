@@ -81,36 +81,39 @@ def test_every_defect_type_fires_at_the_standard_fixture_size(tmp_path):
 def test_book_is_calibrated_to_the_published_gnpa(tmp_path):
     """The headline calibration gate, run across seeds so it is not seed-luck.
 
-    Gated on the CRISIL-basis measure -- 90+ DPD including the trailing twelve
-    months of write-offs -- because that is the basis the published 2.0% is
-    stated on. The on-book measure is a different number entirely and matching
-    it against this target would be meaningless.
+    Gated on the plain gross NPA ratio -- 90+ DPD over gross advances -- because
+    that is what the published 2.0% is. The same rationale carries a second
+    metric, "90+ dpd including last 12 months write-offs / Disbursements", whose
+    denominator is disbursements rather than advances; matching this target to
+    that ratio is the mistake this gate exists to prevent.
     """
     for seed in (42, 7, 99, 2026):
         generate(["--loans", "8000", "--merchants", "200", "--months", "24",
                   "--seed", str(seed), "--as-of", "2026-08-31",
                   "--out", str(tmp_path / str(seed))])
         out = report(tmp_path / str(seed), date(2026, 8, 31))
-        drift = abs(out["gnpa_pct_crisil_basis"] - C.TARGET_GNPA)
+        drift = abs(out["gnpa_pct"] - C.TARGET_GNPA)
         assert drift <= C.GNPA_TOLERANCE, (
-            f"seed {seed}: GNPA {out['gnpa_pct_crisil_basis']:.3%} drifted "
+            f"seed {seed}: GNPA {out['gnpa_pct']:.3%} drifted "
             f"{drift:.3%} from target {C.TARGET_GNPA:.3%}")
 
 
-def test_average_ticket_lands_in_the_published_range(tmp_path):
-    """The second published anchor.
+def test_average_ticket_matches_the_published_portfolio_figure(tmp_path):
+    """The second published anchor, and the one that needs care to read.
 
-    CRISIL puts Snapmint's average ticket at Rs 3,500-Rs 25,000. The ticket
-    distribution's shape is an assumption, but the band it lands in is not, so
-    the shape is not free to drift.
+    The rationale contains two ticket numbers: "average ticket size ranging from
+    Rs 3,500 to Rs 25,000", which is a range across products, and "As of
+    December 31, 2025, the average ticket size for the overall portfolio was
+    Rs 3,500", which is the portfolio mean. A book-level average has to match the
+    second. Treating the first as a band the mean may sit anywhere inside let
+    this book run four times too large.
     """
     generate(["--loans", "8000", "--merchants", "200", "--months", "24",
               "--seed", "42", "--as-of", "2026-08-31", "--out", str(tmp_path)])
     ats = report(tmp_path, date(2026, 8, 31))["avg_ticket_size"]
-    lo, hi = C.TARGET_ATS_RANGE
-    assert lo <= ats <= hi, (
-        f"average ticket Rs {ats:,.0f} is outside the published "
-        f"Rs {lo:,}-Rs {hi:,} range")
+    assert abs(ats - C.TARGET_ATS) <= C.ATS_TOLERANCE, (
+        f"average ticket Rs {ats:,.0f} is off the published "
+        f"Rs {C.TARGET_ATS:,} by more than Rs {C.ATS_TOLERANCE:,}")
 
 
 def test_delinquency_ladder_is_monotonic(tmp_path):
@@ -121,12 +124,11 @@ def test_delinquency_ladder_is_monotonic(tmp_path):
 
     Measured over **every month end in the window**, pooled, rather than at the
     single as-of date. That is not a convenience -- it is what the property
-    actually claims. Once the book was recalibrated to the published GNPA it
-    became clean enough that a single date holds only a few dozen accounts per
-    bucket, and at that sample the ordering is decided by one large-ticket loan
-    landing in one bucket rather than another: seed 7 at 40,000 loans inverts
-    1-30 and 31-60 by a single basis point. Pooling gives ~24x the sample from
-    the same generated book and tests the steady state instead of one draw.
+    actually claims, and it is also what makes the assertion robust. At one date
+    a fixture-sized book holds only tens of accounts per bucket, and at that
+    sample the ordering can be decided by a single large-ticket loan landing in
+    one bucket rather than another. Pooling gives ~24x the sample from the same
+    generated book and tests the steady state instead of one draw.
 
     90+ is deliberately excluded. It is open-ended -- accounts accumulate there
     until write-off at 180 DPD, while every other bucket is a 30-day window --

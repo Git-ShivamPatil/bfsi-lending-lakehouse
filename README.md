@@ -111,26 +111,26 @@ See [Cost](#cost-actually-zero).
 |---|---|
 | Loans / customers / merchants | 150,000 · 105,000 · 1,400 |
 | EMI schedule rows | 1,124,484 |
-| Repayment attempts | 807,166 |
-| Raw extract size | 130 MB CSV |
+| Repayment attempts | 816,928 |
+| Raw extract size | 128 MB CSV |
 | Generation time | **64 s** on a 2-core i3, no third-party dependency |
 | Independent back-test | 43 s |
-| Open loans at as-of | 62,723 |
-| Principal outstanding | ₹53.93 crore |
-| Average ticket | ₹14,604 |
-| Written off (>180 DPD) | 2,209 loans, of which 1,938 in the last 12 months |
+| Open loans at as-of | 63,137 |
+| Principal outstanding | ₹13.16 crore |
+| Average ticket | ₹3,512 |
+| Written off (>180 DPD) | 3,888 loans, of which 3,355 in the last 12 months |
 
 **Portfolio position at 2026-08-31**
 
 | Bucket | Share of book by value | Loans |
 |---|---:|---:|
-| Current | 97.87% | 61,105 |
-| 1–30 DPD (SMA-0) | 0.61% | 334 |
-| 31–60 DPD (SMA-1) | 0.45% | 299 |
-| 61–90 DPD (SMA-2) | 0.34% | 250 |
-| 90+ DPD (NPA) | **0.73%** | 735 |
+| Current | 94.91% | 59,923 |
+| 1–30 DPD (SMA-0) | 1.59% | 846 |
+| 31–60 DPD (SMA-1) | 1.06% | 605 |
+| 61–90 DPD (SMA-2) | 0.61% | 412 |
+| 90+ DPD (NPA) | **1.84%** | 1,351 |
 
-Median monthly collection efficiency **98.8%**.
+Median monthly collection efficiency **97.4%**, bounce rate **3.4%** of attempts.
 
 ### Why those numbers are the right ones
 
@@ -140,37 +140,48 @@ Pvt Ltd reports **GNPA of 2.0%** as at 31 Dec 2025. The generator targets it and
 CI fails the build if it drifts more than 60 bps:
 
 ```
-GNPA (CRISIL basis: 90+ incl. trailing-12m write-offs) 2.084% vs target 2.000%
-  (tolerance +/-0.600%) -> drift 0.084%
-GNPA (90+ on the surviving book, for contrast) 0.732%
-Average ticket Rs 14,604 vs published range Rs 3,500-Rs 25,000
+GNPA (90+ DPD over gross advances) 1.838% vs target 2.000%
+  (tolerance +/-0.600%) -> drift 0.162%
+Average ticket Rs 3,512 vs published Rs 3,500 (tolerance +/-Rs 400) -> drift Rs 12
+90+ incl. trailing-12m write-offs / trailing-12m disbursements 2.237%
+  (CRISIL reports 2.7% at 31 Dec 2025 on its own denominator)
 ```
 
-#### The definition matters more than the number
+#### Reading the source is half the work
 
-CRISIL does not say "GNPA 2.0%". It says **"90+ dpd including last 12 months'
-write-offs"** — so a year of written-off principal sits in *both* the numerator
-and the denominator. That is a different ratio from 90+ DPD on the surviving
-book, which is the one a pipeline reaches for by default.
+The rationale contains **two different ratios**, and this project got the
+distinction wrong in both directions before settling it against the primary
+source.
 
-On this book the two read **2.08% and 0.73%**. They are not close, and for a
-long time this project computed the second and compared it to a target published
-on the first. That is an apples-to-oranges comparison, and a credit analyst
-finds it in one question.
+What it says plainly is *"Its GNPA improved from ~3.1% as on March 31, 2025, to
+~2.0% as on December 31, 2025"* — an ordinary gross NPA, 90+ DPD over gross
+advances. That is what the build gates on.
 
-Both are now computed on both sides — Spark SQL off the arrears anchor, pure
-Python off the observed DPD — and [the parity test](tests/test_pipeline.py)
-asserts the two implementations agree on *each*. The write-off-inclusive measure
-is the harder one to get right, because it depends on reconstructing when each
-account crossed the threshold, and the two implementations get there by
-different routes.
+Elsewhere in the same document is a second metric: **"90+ dpd including last 12
+months write-offs / Disbursements"**, at 2.7% (Dec 25), 4.8% (Mar 25) and 6.3%
+(Mar 24). Its denominator is *disbursements*, not advances, which makes it a
+loss rate on origination rather than a GNPA at all.
 
-Matching the definitions up showed the book had been about three times too
-risky. Correcting it moved the entry hazard from 0.0075 to 0.0016 — found by
-sweep, because the response is strongly sublinear: a cleaner book also closes
-faster and shrinks its own denominator.
+For one commit this repository read the second as a definitional gloss on the
+first, folded write-offs into a gross-advances denominator, and recalibrated to
+match — producing a ratio belonging to neither and a book roughly three times too
+clean. The fix was to go back and read the sentence. The supplementary ratio is
+now computed and reported beside the GNPA, on a trailing-twelve-month
+denominator with that choice stated, because "Disbursements" over a nine-month
+reporting period is genuinely ambiguous from outside the company. It is reported,
+not matched to a target.
 
-Beyond the definition, holding the target across seeds took three modelling
+The same care applies to the ticket figure. *"Average ticket size ranging from
+Rs 3,500 to Rs 25,000"* is a range **across products**; *"As of December 31,
+2025, the average ticket size for the overall portfolio was Rs 3,500"* is the
+portfolio mean, and it is the one a book-level average has to hit. Reading the
+first as a band the mean may sit anywhere inside let this book run four times too
+large. Arithmetic settles it independently of the wording: at ₹3,500 the
+published disbursement series implies about 10.2 million loans, consistent with
+CRISIL's "15+ million transactions"; at ₹14,604 it implies 2.4 million, which
+cannot be reconciled with the same document.
+
+Beyond the definitions, holding the target across seeds took three modelling
 corrections that a naive generator gets wrong, and each one is a real property
 of a lending book:
 
@@ -178,16 +189,17 @@ of a lending book:
    short-tenure loans mature and close while defaults persist, the denominator
    collapses, and GNPA drifts up without limit. The first version of this
    generator produced **24.9%**.
-2. **Write-offs have to leave the book** — and then come back for this one
-   ratio. Accounts past 180 DPD are excluded from gross advances, or losses get
-   counted twice; the CRISIL measure then adds the recent ones back deliberately.
+2. **Write-offs have to leave the book.** Accounts past 180 DPD are excluded
+   from gross advances; without that rule, losses are counted twice and GNPA
+   drifts up without limit.
 3. **Vintage curves have to be cumulative and measured at equal months-on-book.**
    More on that below — it is the subtlest of the three.
 
-A second published anchor guards the ticket distribution. The same CRISIL
-document puts the average ticket at **₹3,500–₹25,000**, and the build fails if
-the generated mean lands outside it. The distribution's *shape* is still an
-assumption; the band it has to land in is not.
+A second published anchor guards the ticket distribution: the build fails if the
+generated mean drifts more than ₹400 from the published ₹3,500. The
+distribution's *shape* is still an assumption; the mean it has to hit is not.
+Ticket size does not enter the hazard function, so the two gates are independent
+and can be tuned one at a time.
 
 ---
 
@@ -339,17 +351,13 @@ passing its own assertions. **40 tests**, all green, covering determinism,
 amortisation reconciliation, ANSI-mode `try_cast` behaviour, rule compilation,
 quarantine correctness, snapshot reproducibility for historical dates, roll-rate
 closure, vintage monotonicity, ECL staging completeness, Delta idempotency, both
-published calibration gates, and cross-implementation parity on *both* GNPA
-definitions.
+published calibration gates, and cross-implementation parity on GNPA.
 
-One honest note on that parity. At fixture scale the two agree comfortably. At
-the full 150k book the Spark gold layer reported a CRISIL-basis GNPA of
-**1.907%** on Databricks against the Python back-test's **2.084%** — an 18 bp
-gap, inside the ±20 bp the test allows but not by much. Both sit well inside the
-±60 bp calibration tolerance, and the on-book measure agrees to a single basis
-point (0.733% vs 0.732%), which points at the write-off-window reconstruction
-rather than the delinquency logic. Tightening that is on the list below rather
-than written up as though it were already understood.
+A third oracle sits alongside those: the [SQL exercises](exercises/) are checked
+against expected outputs computed by hand, and each one also asserts that the
+*naive* query disagrees with them. Between the three, every definition in this
+repository is stated at least twice and the two statements are required to
+match.
 
 ---
 
@@ -488,23 +496,23 @@ lending data is used, and none of it is scraped from anywhere.
   bronze append would be closer to how a real lender ingests.
 - **The `_corrupt_record` column is dropped after silver** rather than being
   retained for forensics. It should be kept with the quarantine.
-- **The bounce rate is not a bounce rate.** It reads 0.73% of attempts, and
-  NACH debit returns across the Indian industry run far higher than that. The
+- **The bounce rate is not really a bounce rate.** It reads 3.4% of attempts,
+  where NACH debit returns across the Indian industry run far higher. The
   model's hazard is the probability of *entering delinquency*, not of a single
   failed presentation — a bounce that cures within the same cycle is never
-  emitted at all. The column name promises more than the model delivers, and
-  recalibrating the book made the gap wider. Modelling presentation-level
-  retries separately from delinquency entry is the fix.
-- **The write-off window reconstruction is the weakest link in parity.** The
-  Spark and Python implementations agree to a basis point on the on-book GNPA
-  and to 18 bp on the write-off-inclusive one. Both derive the write-off date
-  from the arrears anchor, so the residual is probably grain — month-end rows
-  versus an as-of computation — but "probably" is not "measured".
+  emitted at all. The column name promises more than the model delivers.
+  Modelling presentation-level retries separately from delinquency entry is the
+  fix, and it would also give first-payment default an independent mechanism,
+  which [the analysis](docs/ANALYSIS.md) shows it currently lacks.
+- **Bounce reasons are sampled independently of collection mode**, so a
+  `SIGNATURE_MISMATCH` can be returned against a UPI autopay mandate. Harmless
+  to every metric computed here, and obviously wrong to anyone who has worked a
+  collections queue.
 - **The bundle has never been deployed.** It is schema-checked on every push
   and it is written to the serverless constraints, but the end-to-end run went
   through a Git folder and a notebook.
-- **A lending book this clean is a modelling choice, not a fact.** Matching a
-  2.0% write-off-inclusive GNPA on a 12-month-tenor book forces a low entry
-  hazard, and the resulting delinquency stock at any single month end is thin
-  enough that some distributional tests need pooling across the window to have
-  any statistical power at all.
+- **Several segment cuts have no statistical power.** The configured city-tier
+  risk gradient is 14%, and at 150k loans that is about two standard errors —
+  the observed ordering does not match the configured one. Any conclusion drawn
+  from a segment cut on a book this size needs the arithmetic done first, which
+  is why the analysis document does it out loud.

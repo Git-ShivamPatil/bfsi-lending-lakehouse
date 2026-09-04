@@ -136,7 +136,7 @@ for name, n in build_gold(spark, layout).items():
 
 # MAGIC %sql
 # MAGIC SELECT snapshot_date, live_loans, principal_outstanding,
-# MAGIC        gnpa_ratio_crisil_basis, gnpa_ratio_on_book, par_30, par_90
+# MAGIC        gnpa_ratio, par_30, par_90
 # MAGIC FROM   workspace.default.gold_portfolio_summary
 # MAGIC ORDER  BY snapshot_date DESC
 # MAGIC LIMIT  12

@@ -277,18 +277,24 @@ def report(data: Path, as_of: date) -> dict:
     npa_os = sum(r["outstanding"] for r in book
                  if r["dpd"] > C.NPA_DPD_THRESHOLD)
 
-    # CRISIL states Snapmint's GNPA as "90+ dpd including last 12 months'
-    # write-offs", so the trailing year of written-off principal is added to
-    # both sides of the ratio. Without this the project would be calibrating an
-    # on-book measure against a target published on a write-off-inclusive one --
-    # on this book those read 1.8% and 5.6%, which is the whole difference
-    # between a defensible claim and an indefensible one.
+    # CRISIL's supplementary ratio: "90+ dpd including last 12 months
+    # write-offs / Disbursements". Note the denominator -- it is disbursements
+    # for the period, NOT gross advances, which makes this a loss rate on
+    # origination rather than a second GNPA. Folding write-offs into an advances
+    # denominator produces a number belonging to neither ratio.
+    #
+    # "Disbursements" over a nine-month reporting period is ambiguous from
+    # outside the company, so this uses a trailing twelve months and says so
+    # rather than pretending the convention is settled. Reported, not gated.
     recent_write_offs = [
         r for r in written_off
         if (as_of - written_off_on(r, as_of)).days <= C.GNPA_WRITE_OFF_LOOKBACK_DAYS
     ]
     wo_os = sum(r["outstanding"] for r in recent_write_offs)
-    gnpa_crisil = (npa_os + wo_os) / (total_os + wo_os) if (total_os + wo_os) else 0.0
+    window_start = as_of - timedelta(days=C.GNPA_WRITE_OFF_LOOKBACK_DAYS)
+    disbursed_ttm = sum(l["principal"] for l in loans.values()
+                        if l["principal"] > 0 and l["disbursed_at"] > window_start)
+    loss_on_disbursements = ((npa_os + wo_os) / disbursed_ttm) if disbursed_ttm else 0.0
 
     tickets = [l["principal"] for l in loans.values() if l["principal"] > 0]
     avg_ticket = sum(tickets) / len(tickets) if tickets else 0.0
@@ -314,13 +320,14 @@ def report(data: Path, as_of: date) -> dict:
         "as_of": as_of.isoformat(),
         "open_loans": len(book),
         "principal_outstanding": round(total_os, 2),
-        # The measure CRISIL publishes, and the one the build is gated on.
-        "gnpa_pct_crisil_basis": round(gnpa_crisil, 5),
-        # 90+ DPD on the surviving book. Reported alongside because it is the
-        # measure most pipelines compute, and the gap between the two is the
-        # point.
-        "gnpa_pct_on_book": round(npa_os / total_os, 5) if total_os else 0.0,
-        "write_offs_in_gnpa_window": len(recent_write_offs),
+        # Gross NPA: 90+ DPD over gross advances on the book. This is the plain
+        # ratio CRISIL states as 2.0%, and the one the build is gated on.
+        "gnpa_pct": round(npa_os / total_os, 5) if total_os else 0.0,
+        # CRISIL's separate loss-on-origination ratio. Different denominator,
+        # different meaning; reported for shape, not matched to a target.
+        "write_off_incl_90plus_over_disbursements_ttm": round(loss_on_disbursements, 5),
+        "disbursed_trailing_12m": round(disbursed_ttm, 2),
+        "write_offs_in_window": len(recent_write_offs),
         "write_off_principal_in_window": round(wo_os, 2),
         "avg_ticket_size": round(avg_ticket, 2),
         "bucket_mix_by_value": {
@@ -353,22 +360,26 @@ def main(argv=None) -> int:
 
     failures = []
 
-    gnpa = out["gnpa_pct_crisil_basis"]
+    gnpa = out["gnpa_pct"]
     drift = abs(gnpa - C.TARGET_GNPA)
-    print(f"\nGNPA (CRISIL basis: 90+ incl. trailing-12m write-offs) "
-          f"{gnpa:.3%} vs target {C.TARGET_GNPA:.3%} "
-          f"(tolerance +/-{C.GNPA_TOLERANCE:.3%}) -> drift {drift:.3%}")
-    print(f"GNPA (90+ on the surviving book, for contrast) "
-          f"{out['gnpa_pct_on_book']:.3%}")
+    print(f"\nGNPA (90+ DPD over gross advances) {gnpa:.3%} vs target "
+          f"{C.TARGET_GNPA:.3%} (tolerance +/-{C.GNPA_TOLERANCE:.3%}) "
+          f"-> drift {drift:.3%}")
     if drift > C.GNPA_TOLERANCE:
         failures.append("GNPA outside tolerance; recalibrate generator/config.py")
 
-    lo, hi = C.TARGET_ATS_RANGE
     ats = out["avg_ticket_size"]
-    print(f"Average ticket Rs {ats:,.0f} vs published range "
-          f"Rs {lo:,}-Rs {hi:,}")
-    if not lo <= ats <= hi:
-        failures.append(f"average ticket Rs {ats:,.0f} outside the published range")
+    ats_drift = abs(ats - C.TARGET_ATS)
+    print(f"Average ticket Rs {ats:,.0f} vs published Rs {C.TARGET_ATS:,} "
+          f"(tolerance +/-Rs {C.ATS_TOLERANCE:,}) -> drift Rs {ats_drift:,.0f}")
+    if ats_drift > C.ATS_TOLERANCE:
+        failures.append(f"average ticket Rs {ats:,.0f} is off the published "
+                        f"Rs {C.TARGET_ATS:,}")
+
+    # Reported, not gated -- the denominator convention is our reading.
+    print(f"90+ incl. trailing-12m write-offs / trailing-12m disbursements "
+          f"{out['write_off_incl_90plus_over_disbursements_ttm']:.3%} "
+          f"(CRISIL reports 2.7% at 31 Dec 2025 on its own denominator)")
 
     for f in failures:
         print(f"FAIL: {f}")
