@@ -24,6 +24,7 @@ from pathlib import Path
 
 from generator import config as C
 from validation.backtest import load, month_end_snapshots, report
+from validation.rules import RULES
 
 # ---------------------------------------------------------------------------
 # palette -- one hue ramp for severity, so the eye reads depth as risk
@@ -92,6 +93,35 @@ def stacked_bars(series, width=980, height=210, pad=34):
             out.append(f'<text x="{x + bw / 2:.1f}" y="{height - 8}" '
                        f'text-anchor="middle" class="tick">{month[2:]}</text>')
 
+    out.append("</svg>")
+    return "".join(out)
+
+
+def funnel_bars(stages, width=980, height=132, pad=34):
+    """Three stacked bars, each drawn as a share of applications received.
+
+    Deliberately not the tapering-trapezoid shape a slide deck uses: a trapezoid
+    encodes the drop in *area*, which reads as a bigger fall than the numbers
+    support. Equal-height bars on a common baseline compare by length, which is
+    the one visual channel people read accurately.
+    """
+    top = stages[0][1] or 1
+    bar_h = (height - pad) / len(stages) - 10
+    out = [f'<svg viewBox="0 0 {width} {height}" width="100%" '
+           f'role="img" aria-label="Checkout funnel">']
+    for i, (label, value, note) in enumerate(stages):
+        y = 6 + i * (bar_h + 10)
+        # the bar stops well short of the right edge so the longest annotation
+        # still fits on the widest bar
+        w = (width - 430) * value / top
+        out.append(
+            f'<rect x="150" y="{y:.1f}" width="{w:.1f}" height="{bar_h:.1f}" '
+            f'rx="3" fill="{BUCKET_COLOUR["CURRENT"]}" '
+            f'opacity="{1 - i * 0.22:.2f}"/>'
+            f'<text x="142" y="{y + bar_h / 2 + 4:.1f}" text-anchor="end" '
+            f'font-size="12.5" fill="#16191d">{label}</text>'
+            f'<text x="{150 + w + 9:.1f}" y="{y + bar_h / 2 + 4:.1f}" '
+            f'font-size="12.5" fill="#5b626b">{value:,} · {note}</text>')
     out.append("</svg>")
     return "".join(out)
 
@@ -262,6 +292,8 @@ a{color:var(--accent)}
 def render(summary, mix_series, roll_rates, vintage, manifest, as_of) -> str:
     counts = manifest.get("counts", {})
     defects = manifest.get("injected_defects", {})
+    funnel = summary.get("funnel", {})
+    n_rules = len(RULES)
 
     tiles = [
         ("Principal outstanding", crore(summary["principal_outstanding"]),
@@ -277,6 +309,8 @@ def render(summary, mix_series, roll_rates, vintage, manifest, as_of) -> str:
         ("PAR&nbsp;30", pct(sum(v for k, v in summary["bucket_mix_by_value"].items()
                                 if k in ("31-60", "61-90", "90+"))),
          "31+ DPD by value"),
+        ("Approval rate", pct(funnel.get("approval_rate", 0), 1),
+         "of decisioned applications"),
         ("Collection efficiency", pct(summary["collection_efficiency_median"], 1),
          "median month"),
         ("Bounce rate", pct(summary["bounce_rate_of_attempts"], 2), "of all attempts"),
@@ -325,6 +359,46 @@ def render(summary, mix_series, roll_rates, vintage, manifest, as_of) -> str:
 
     ce_points = sorted(summary["collection_efficiency_by_month"].items())[1:-1]
 
+    # checkout funnel
+    funnel_html = ""
+    if funnel:
+        stages = [
+            ("Applications", funnel["applications"], "received"),
+            ("Approved", funnel["approved"],
+             f"{funnel['approval_rate'] * 100:.1f}% of decisioned"),
+            ("Disbursed", funnel["converted"],
+             f"{funnel['conversion_of_approved'] * 100:.1f}% of approvals · "
+             f"{funnel['application_to_loan'] * 100:.1f}% end to end"),
+        ]
+        dm = funnel.get("decline_mix", {})
+        declined = funnel["applications"] - funnel["approved"]
+        dm_rows = "".join(
+            f"<tr><td>{html.escape(k.replace('_', ' ').title())}</td>"
+            f"<td>{round(v * declined):,}</td><td>{v * 100:.1f}%</td></tr>"
+            for k, v in sorted(dm.items(), key=lambda kv: -kv[1]))
+        funnel_html = f"""
+<h2>Checkout funnel</h2>
+<div class="card">{funnel_bars(stages)}
+<p class="note">Approval rate is stated on <strong>decisioned</strong>
+applications, not on every application received. Every application here carries
+a decision so the two coincide — but where a decisioning lag exists, counting
+undecided applications as implicit rejections depresses the most recent month
+and reads as a policy tightening that never happened.</p>
+<p class="note">The gap between approval and disbursal is the
+<strong>down payment</strong>: approved at checkout, then abandoned rather than
+paying the {C.DOWN_PAYMENT_RANGE[0]:.0%}–{C.DOWN_PAYMENT_RANGE[1]:.0%} up front.
+That is a product problem, not a credit one, and the two are computed apart so
+they can be argued about separately.</p></div>
+
+<h2>Why applications were declined</h2>
+<div class="card"><div class="scroll"><table>
+<tr><th>Reason</th><th>Applications</th><th>Share of declines</th></tr>
+{dm_rows}</table></div>
+<p class="note">Declines are a fixed mix rather than the output of the policy
+that produced them — the approval <em>rate</em> varies by bureau band, the reason
+for a given decline does not. Stated here rather than left for someone to
+discover.</p></div>"""
+
     defect_rows = "".join(
         f"<tr><td>{html.escape(k.replace('_', ' '))}</td><td>{v:,}</td></tr>"
         for k, v in sorted(defects.items(), key=lambda kv: -kv[1]))
@@ -339,12 +413,14 @@ def render(summary, mix_series, roll_rates, vintage, manifest, as_of) -> str:
 <p class="sub">Synthetic Indian no-cost-EMI portfolio · position as at
 <strong>{as_of.isoformat()}</strong> ·
 <a href="https://github.com/Git-ShivamPatil/bfsi-lending-lakehouse">source on GitHub</a></p>
-<p class="sub">{counts.get('loans', 0):,} loans ·
+<p class="sub">{counts.get('applications', 0):,} applications ·
+{counts.get('loans', 0):,} loans ·
 {counts.get('emi_schedule', 0):,} instalments ·
 {counts.get('repayment_attempts', 0):,} repayment attempts. Every figure is
 computed from the same extracts the PySpark medallion pipeline reads.</p>
 
 <div class="tiles">{tile_html}</div>
+{funnel_html}
 
 <h2>Delinquency bucket mix by month, by value</h2>
 <div class="card">{stacked_bars(mix_series)}<div class="legend">{legend}</div></div>
@@ -372,9 +448,10 @@ look like they improve with age.</p></div>
 <h2>Data quality — defects injected on purpose</h2>
 <div class="card"><div class="scroll"><table>
 <tr><th>Defect</th><th>Rows</th></tr>{defect_rows}</table></div>
-<p class="note">The generator corrupts the book at known rates so the 29-rule
-validation layer is scored against a ground truth rather than grading its own
-homework. Every one of these is caught and quarantined with the rule it broke.</p></div>
+<p class="note">The generator corrupts the book at known rates so the
+{n_rules}-rule validation layer is scored against a ground truth rather than grading
+its own homework. Every one of these is caught and quarantined with the rule it
+broke.</p></div>
 
 <p class="note" style="margin-top:30px">Generated by
 <code>docs/build_dashboard.py</code> · no JavaScript, no external requests.</p>

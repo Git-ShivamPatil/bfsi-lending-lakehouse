@@ -14,8 +14,9 @@ It runs at **zero cost**, on free tiers only, and every headline number below
 came out of a real run rather than an illustration.
 
 **→ [Live dashboard](https://git-shivampatil.github.io/bfsi-lending-lakehouse/)**
-— portfolio position, roll-rate matrix, vintage triangle and data-quality
-scorecard, rebuilt by CI on every push.
+— checkout funnel and decline mix, portfolio position, roll-rate matrix,
+vintage triangle and data-quality scorecard, rebuilt by CI on every push at the
+same 150,000-loan configuration the figures below quote.
 
 **→ [What the book actually says](docs/ANALYSIS.md)** — the analyst's read, with
 every finding labelled as a property of the portfolio, a property of the
