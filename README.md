@@ -39,6 +39,12 @@ executed top to bottom against `workspace.default`: the generator on the driver
 (pure standard library, nothing installed), then bronze → silver → snapshot →
 gold.
 
+These figures are from commit `09e9f80`. The NPA glide path landed after it, and
+changes `asset_classification` — so the gold *bucket mix* row count below will
+differ on a re-run. Everything else is unaffected, because GNPA, PAR and the
+bronze counts key off DPD rather than off the regulatory classification. Saying
+which commit a number came from is cheaper than discovering later that it drifted.
+
 | | |
 |---|---|
 | Bronze rows landed | 1,400 · 105,000 · 150,000 · 1,124,484 · **820,274** |
