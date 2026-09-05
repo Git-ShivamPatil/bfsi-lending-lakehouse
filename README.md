@@ -31,39 +31,50 @@ Being straight about this matters more than the claim it costs me:
 | Generator, back-test, dashboard | Verified locally **and** in CI |
 | Medallion pipeline (bronze → gold) | Verified in CI on PySpark **3.5.3 and 4.2.0** |
 | Incremental `MERGE INTO`, Delta time travel | Verified in CI (needs a Delta runtime) |
-| Databricks Free Edition | **Run end to end on 2026-09-05**, from a Git folder, on serverless. Figures below. |
+| Databricks Free Edition | **Run end to end on 2026-09-06**, from a Git folder, on serverless. Figures below. |
 | The deployment bundle | Schema-valid and serverless-clean in CI on every push. **Not yet deployed** — see the caveat below. |
 
 **What the Databricks run produced.** [`notebooks/run_pipeline.py`](notebooks/run_pipeline.py)
 executed top to bottom against `workspace.default`: the generator on the driver
 (pure standard library, nothing installed), then bronze → silver → snapshot →
-gold.
+gold, ending with `CLUSTER BY` and `OPTIMIZE` on the snapshot. Ten code cells,
+roughly three and a half minutes of wall-clock, every cell green.
 
-These figures are from commit `09e9f80`. The NPA glide path landed after it, and
-changes `asset_classification` — so the gold *bucket mix* row count below will
-differ on a re-run. Everything else is unaffected, because GNPA, PAR and the
-bronze counts key off DPD rather than off the regulatory classification. Saying
-which commit a number came from is cheaper than discovering later that it drifted.
+These figures are from commit `4851f66`, at 150,000 loans and 1,400 merchants,
+seed 42, as-of 2026-08-31. Saying which commit a number came from is cheaper
+than discovering later that it drifted.
 
 | | |
 |---|---|
-| Bronze rows landed | 1,400 · 105,000 · 150,000 · 1,124,484 · **820,274** |
-| Gold tables built | 8 — portfolio 24, bucket mix 113, roll rate 430, vintage 300, collections 36, merchant risk 1,400, ECL staging 68, DQ scorecard 9 |
-| GNPA at 2026-08-31 | **1.842%** — against **1.838%** from the independent Python back-test |
-| PAR-30 | 3.512% |
-| Live loans / principal outstanding | 62,921 · ₹13.09 crore |
+| Bronze rows landed | 1,400 · 105,000 · **257,850** · 150,000 · 1,123,464 · **822,886** |
+| Silver rows kept | 1,400 · 104,691 · 257,070 · 149,202 · 1,114,713 · 812,384, with **21,197** rows quarantined |
+| Snapshot | 902,567 loan-date rows across 24 month ends |
+| Gold tables built | 11 — portfolio 24, funnel 75, decline mix 6, first-payment default 237, bucket mix 126, roll rate 441, vintage 300, collections 36, merchant risk 176, ECL staging 68, DQ scorecard 10 |
+| GNPA at 2026-08-31 | **1.952%** — against **1.944%** from the independent Python back-test |
+| PAR-30 | 3.604% |
+| Live loans / principal outstanding | 63,199 · ₹13.27 crore |
+
+Merchant risk carries 176 rows rather than 1,400 because it reports only
+merchants with at least 20 live loans. A PAR-30 z-score computed off three
+accounts is noise wearing a decimal point, and the merchant book is a power law —
+most of the 1,400 never reach the threshold.
 
 **Two reconciliations worth more than the run itself.** The bronze count is
-exact: the generator emitted 816,928 repayment attempts and deliberately
-injected 3,346 duplicate keys, and 816,928 + 3,346 = 820,274. The quarantine
-reconciles the same way, rule by rule, against the number of defects injected.
+exact: the generator emitted 819,526 repayment attempts and deliberately
+injected 3,360 duplicate keys, and 819,526 + 3,360 = 822,886. The quarantine
+reconciles the same way, rule by rule, against the number of defects injected —
+`LOAN_002` caught 321 negative principals against 321 injected, `REPAY_008`
+caught 3,360 duplicates against 3,360 injected.
 
-And the GNPA computed by Spark on Databricks lands **0.4 bp** from the one
+And the GNPA computed by Spark on Databricks lands **0.8 bp** from the one
 computed by a few hundred lines of pure Python over the same CSVs on a laptop.
-Two implementations, two languages, two machines, one definition.
+Two implementations, two languages, two machines, one definition. They are not
+identical, and should not be: Spark reports on the 149,202 loans that survived
+the rule repository, the back-test on all 150,000 raw rows minus the ones its own
+cleaning drops. The gap *is* the quarantine, and it is 8 basis points wide.
 
-**Three things broke on the way**, none of which CI could have caught, because
-CI runs open-source Spark on a local master where all three work:
+**Four things broke on the way**, none of which CI could have caught, because
+CI runs open-source Spark on a local master where all four work:
 
 - `clean.py` cached the cleaned frame. The DataFrame and SQL caching APIs raise
   on serverless compute, which is all Free Edition has — so the pipeline as
@@ -76,6 +87,10 @@ CI runs open-source Spark on a local master where all three work:
   `overwriteSchema`; the incremental path deliberately does not, because a merge
   wants additive evolution and replacing a schema you meant to evolve drops
   columns.
+- Pulling new commits into the Git folder and re-running produced a **fully
+  green run against stale code**, because the notebook session still held the
+  previously imported modules. Nothing failed; the numbers were simply the
+  previous run's. See [the note under Run it](#on-databricks-free-edition).
 
 **What is still not proven.** The bundle in [`databricks.yml`](databricks.yml)
 has never been deployed — it is checked against the CLI's own JSON schema on
@@ -105,7 +120,7 @@ Unity Catalog external location requires, and the workspace therefore cannot
 read an external S3 bucket at all. "S3 is the lake, Databricks queries it" is
 not buildable here.
 
-Two ways in, then. The run on 2026-09-05 used the first:
+Two ways in, then. The runs on 2026-09-05 and 2026-09-06 used the first:
 
 - **On the driver.** The generator has no third-party dependencies, so it runs
   inside the workspace and writes straight into the volume. Nothing to upload,
@@ -498,7 +513,7 @@ python -m pytest tests/ -q -m delta         # Linux / CI
 
 ### On Databricks Free Edition
 
-This is the path that was actually walked on 2026-09-05, and it needs no
+This is the path that was actually walked on 2026-09-06, and it needs no
 credentials anywhere — the repository is public, so the Git folder clones
 without auth, and the generator runs on the driver rather than the data being
 uploaded:
@@ -511,6 +526,16 @@ uploaded:
 3. Open `notebooks/run_pipeline.py` and **Run all**. The first cell creates the
    landing volume in `workspace.default`; the rest is bronze → silver →
    snapshot → gold.
+
+**One thing to know if you pull and re-run.** Pulling new commits into the Git
+folder does not reload modules Python has already imported, and a notebook keeps
+its session between runs. A re-run after a pull therefore executes the *old*
+`generator` and `pipeline` code from `sys.modules` and produces the previous
+run's numbers, silently and with every cell green. Open a new session first
+(compute dropdown → **New session**), or turn on autoreload. This is a real
+failure mode, not a hypothetical: it produced a full green run against stale
+code here, and the only thing that gave it away was a row count that had not
+moved when it should have.
 
 Nothing is installed on the cluster. Serverless is explicit that installing
 PySpark, or anything depending on it, terminates the session — which the
