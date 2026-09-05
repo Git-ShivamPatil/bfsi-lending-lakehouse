@@ -86,6 +86,109 @@ GROUP  BY snapshot_date, dpd_bucket, asset_classification
 """
 
 # ---------------------------------------------------------------------------
+# the checkout funnel
+# ---------------------------------------------------------------------------
+#
+# The two metrics every checkout-finance job advertisement leads with, and
+# neither was computable while the book started at disbursal.
+#
+# The denominator choice is the whole question. Approval rate is stated on
+# *decisioned* applications, not on all applications received -- otherwise the
+# most recent period always looks worse, because some of it has not been decided
+# yet, and somebody reads a reporting lag as a policy tightening. Here every
+# application carries a decision, so the two coincide; the query is written the
+# careful way anyway, because it will not always be true.
+
+FUNNEL_SQL = """
+SELECT date_trunc('month', applied_at)                              AS month,
+       channel,
+       COUNT(*)                                                     AS applications,
+       COUNT_IF(decision = 'APPROVED')                              AS approved,
+       COUNT_IF(converted = 'Y')                                    AS converted,
+       ROUND(COUNT_IF(decision = 'APPROVED')
+             / NULLIF(COUNT_IF(decision IN ('APPROVED', 'DECLINED')), 0), 5)
+                                                                    AS approval_rate,
+       -- Of what we approved, what actually disbursed. The gap is the down
+       -- payment: approved at checkout, then abandoned rather than paying the
+       -- 25-33% up front. That is a product problem, not a credit one.
+       ROUND(COUNT_IF(converted = 'Y')
+             / NULLIF(COUNT_IF(decision = 'APPROVED'), 0), 5)        AS conversion_of_approved,
+       -- End to end, which is the number a founder asks for.
+       ROUND(COUNT_IF(converted = 'Y') / NULLIF(COUNT(*), 0), 5)     AS application_to_loan,
+       ROUND(AVG(cart_amount), 2)                                    AS avg_cart_amount
+FROM   silver_applications
+GROUP  BY date_trunc('month', applied_at), channel
+ORDER  BY month, channel
+"""
+
+DECLINE_MIX_SQL = """
+SELECT decline_reason,
+       COUNT(*)                                                     AS declines,
+       ROUND(COUNT(*) / SUM(COUNT(*)) OVER (), 5)                   AS share_of_declines
+FROM   silver_applications
+WHERE  decision = 'DECLINED'
+GROUP  BY decline_reason
+ORDER  BY declines DESC
+"""
+
+# ---------------------------------------------------------------------------
+# first-payment default
+# ---------------------------------------------------------------------------
+#
+# FPD is the metric a checkout lender watches most closely, and it answers a
+# different question from lifetime default. A merchant with high FPD and ordinary
+# GNPA is an onboarding or fraud problem; ordinary FPD with high GNPA is an
+# underwriting one. They call for opposite responses, so they are computed apart.
+#
+# NOT EXISTS rather than NOT IN, deliberately: the settlement set can contain a
+# NULL loan_id -- the generator injects orphan repayments precisely because real
+# extracts do -- and NOT IN against a set containing one NULL returns no rows at
+# all, reporting a clean 0% first-payment default across the entire book.
+
+FPD_SQL = """
+WITH first_instalment AS (
+    SELECT loan_id, MIN(due_date) AS due_date
+    FROM   silver_emi_schedule
+    WHERE  instalment_no = 1
+    GROUP  BY loan_id
+),
+eligible AS (
+    SELECT l.loan_id, l.merchant_id, l.principal, f.due_date
+    FROM   silver_loans l
+    JOIN   first_instalment f ON f.loan_id = l.loan_id
+    -- Only loans whose first instalment has had a fair chance to settle.
+    WHERE  f.due_date <= date_sub((SELECT MAX(snapshot_date) FROM silver_loan_snapshot), 30)
+),
+defaulted AS (
+    SELECT e.loan_id,
+           e.merchant_id,
+           e.principal,
+           CASE WHEN NOT EXISTS (
+                    SELECT 1 FROM silver_repayment_attempts r
+                    WHERE  r.loan_id = e.loan_id
+                      AND  r.instalment_no = 1
+                      AND  r.status = 'SUCCESS'
+                      AND  r.paid_at IS NOT NULL
+                      AND  datediff(r.paid_at, e.due_date) <= 30)
+                THEN 1 ELSE 0 END                                   AS is_fpd
+    FROM   eligible e
+)
+SELECT d.merchant_id,
+       m.merchant_name,
+       m.category,
+       COUNT(*)                                                     AS loans,
+       SUM(d.is_fpd)                                                AS fpd_loans,
+       ROUND(SUM(d.is_fpd) / COUNT(*), 5)                           AS fpd_rate,
+       ROUND(AVG(d.principal), 2)                                   AS avg_ticket,
+       ROUND(AVG(SUM(d.is_fpd) / COUNT(*)) OVER (PARTITION BY m.category), 5)
+                                                                    AS category_fpd_rate
+FROM   defaulted d
+JOIN   silver_merchants m ON m.merchant_id = d.merchant_id
+GROUP  BY d.merchant_id, m.merchant_name, m.category
+HAVING COUNT(*) >= 25
+"""
+
+# ---------------------------------------------------------------------------
 # roll rates
 # ---------------------------------------------------------------------------
 #
@@ -369,7 +472,7 @@ def rules_dim(spark: SparkSession) -> DataFrame:
 
 def build(spark: SparkSession, layout: Layout) -> dict[str, int]:
     for entity in ("loans", "emi_schedule", "repayment_attempts", "merchants",
-                   "customers", "quarantine", "loan_snapshot"):
+                   "customers", "applications", "quarantine", "loan_snapshot"):
         spark.table(layout.table("silver", entity)).createOrReplaceTempView(
             f"silver_{entity}")
     rules_dim(spark).createOrReplaceTempView("rules_dim")
@@ -380,6 +483,9 @@ def build(spark: SparkSession, layout: Layout) -> dict[str, int]:
     tables = {
         "portfolio_summary": PORTFOLIO_SQL.format(
             lookback=C.GNPA_WRITE_OFF_LOOKBACK_DAYS),
+        "funnel": FUNNEL_SQL,
+        "decline_mix": DECLINE_MIX_SQL,
+        "first_payment_default": FPD_SQL,
         "bucket_mix": BUCKET_MIX_SQL,
         "roll_rate": ROLL_RATE_SQL,
         "vintage": VINTAGE_SQL,

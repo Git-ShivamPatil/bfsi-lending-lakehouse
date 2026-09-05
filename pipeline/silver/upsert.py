@@ -34,6 +34,7 @@ from ..common import Layout, get_spark
 NATURAL_KEYS: dict[str, tuple[str, ...]] = {
     "customers": ("customer_id",),
     "merchants": ("merchant_id",),
+    "applications": ("application_id",),
     "loans": ("loan_id",),
     "emi_schedule": ("loan_id", "instalment_no"),
     "repayment_attempts": ("attempt_id",),
@@ -124,7 +125,8 @@ def main(argv=None) -> int:
 
     spark = get_spark()
     layout = Layout()
-    order = ["customers", "merchants", "loans", "emi_schedule", "repayment_attempts"]
+    order = ["customers", "merchants", "applications", "loans",
+             "emi_schedule", "repayment_attempts"]
 
     cleaned: dict[str, DataFrame] = {}
     for entity in order:

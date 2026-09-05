@@ -30,7 +30,8 @@ REPORTING_DATE = "2026-08-31"
 @pytest.fixture(scope="session")
 def silver(spark, raw_views):
     """Run bronze views through the silver rule engine, in dependency order."""
-    order = ["customers", "merchants", "loans", "emi_schedule", "repayment_attempts"]
+    order = ["customers", "merchants", "applications", "loans",
+             "emi_schedule", "repayment_attempts"]
     clean_frames = {}
     quarantines = {}
 
@@ -348,6 +349,50 @@ def test_gold_gnpa_matches_the_independent_backtest(spark, snapshot, raw_views):
     # reconstruction could be silently returning nothing and nobody would know.
     assert row["wo_loans_in_window"] > 0, "no write-offs in the trailing window"
     assert row["write_off_principal_in_window"] > 0
+
+
+def test_the_funnel_rates_are_rates(spark, silver):
+    """Approval and conversion must be bounded, and the funnel must narrow.
+
+    The interesting line in FUNNEL_SQL is the denominator: approval rate is
+    stated on *decisioned* applications rather than on all applications
+    received. Where a pipeline has a decisioning lag, counting undecided
+    applications as implicit rejections makes the most recent month look worse
+    and gets read as a policy tightening that never happened.
+    """
+    rows = spark.sql(G.FUNNEL_SQL).collect()
+    assert rows, "no applications reached the funnel query"
+
+    for r in rows:
+        assert r["applications"] >= r["approved"] >= r["converted"], (
+            f"{r['month']} {r['channel']}: the funnel widens, which is not a funnel")
+        for col in ("approval_rate", "conversion_of_approved", "application_to_loan"):
+            assert 0.0 <= r[col] <= 1.0, f"{col} is not a rate: {r[col]}"
+        assert r["avg_cart_amount"] > 0
+
+
+def test_first_payment_default_uses_null_safe_anti_join(spark, silver, snapshot):
+    """FPD must survive an orphan repayment row with a NULL loan_id.
+
+    The generator injects orphan repayments on purpose. `NOT IN` against a
+    subquery containing a single NULL returns no rows at all, which reports a
+    clean 0% first-payment default across the entire book -- a number nobody
+    questions, because a low FPD is what everyone hopes to see. FPD_SQL uses
+    NOT EXISTS, and this asserts the answer is neither zero nor everything.
+    """
+    rows = spark.sql(G.FPD_SQL).collect()
+    assert rows, "no merchant cleared the volume floor"
+
+    total_loans = sum(r["loans"] for r in rows)
+    total_fpd = sum(r["fpd_loans"] for r in rows)
+    rate = total_fpd / total_loans
+
+    assert 0.0 < rate < 0.5, (
+        f"book-wide first-payment default is {rate:.4%}, which is either zero "
+        f"(the NOT IN null trap) or implausibly high")
+    for r in rows:
+        assert 0 <= r["fpd_loans"] <= r["loans"]
+        assert 0.0 <= r["fpd_rate"] <= 1.0
 
 
 def test_ecl_staging_partitions_the_book_exactly_once(spark, snapshot):

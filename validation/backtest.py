@@ -11,7 +11,7 @@ It deliberately duplicates a little of what the silver/gold layers do in PySpark
 That redundancy is the point: if the Spark pipeline and this independent
 implementation disagree, one of them is wrong, and
 `tests/test_pipeline.py::test_gold_gnpa_matches_the_independent_backtest` checks
-they do not -- on both GNPA definitions.
+they do not.
 """
 
 from __future__ import annotations
@@ -142,6 +142,44 @@ def position(lid, loan, inst, paid, as_of: date):
         "bucket": bucket_for(dpd),
         "stage": sma_stage(dpd),
         "written_off": dpd > C.WRITE_OFF_DPD,
+    }
+
+
+def funnel(data: Path) -> dict:
+    """Approval rate and checkout conversion, computed independently of Spark.
+
+    Denominator note, because it is the whole question: approval rate is stated
+    on *decisioned* applications. Counting undecided ones as implicit rejections
+    depresses the most recent period and gets read as a policy tightening that
+    never happened. Every application here carries a decision, so the two
+    coincide -- the distinction is made anyway, because it will not always.
+    """
+    path = data / "applications.csv"
+    if not path.exists():
+        return {}
+
+    total = approved = declined = converted = 0
+    declines: dict[str, int] = defaultdict(int)
+    for r in read(path):
+        total += 1
+        if r["decision"] == "APPROVED":
+            approved += 1
+        elif r["decision"] == "DECLINED":
+            declined += 1
+            declines[r["decline_reason"]] += 1
+        if r["converted"] == "Y":
+            converted += 1
+
+    decisioned = approved + declined
+    return {
+        "applications": total,
+        "approved": approved,
+        "converted": converted,
+        "approval_rate": round(approved / decisioned, 5) if decisioned else 0.0,
+        "conversion_of_approved": round(converted / approved, 5) if approved else 0.0,
+        "application_to_loan": round(converted / total, 5) if total else 0.0,
+        "decline_mix": {k: round(v / declined, 4) for k, v in
+                        sorted(declines.items(), key=lambda x: -x[1])} if declined else {},
     }
 
 
@@ -318,6 +356,7 @@ def report(data: Path, as_of: date) -> dict:
 
     return {
         "as_of": as_of.isoformat(),
+        "funnel": funnel(data),
         "open_loans": len(book),
         "principal_outstanding": round(total_os, 2),
         # Gross NPA: 90+ DPD over gross advances on the book. This is the plain
@@ -375,6 +414,14 @@ def main(argv=None) -> int:
     if ats_drift > C.ATS_TOLERANCE:
         failures.append(f"average ticket Rs {ats:,.0f} is off the published "
                         f"Rs {C.TARGET_ATS:,}")
+
+    f = out.get("funnel") or {}
+    if f:
+        print(f"Funnel: {f['applications']:,} applications -> "
+              f"{f['approved']:,} approved ({f['approval_rate']:.1%}) -> "
+              f"{f['converted']:,} disbursed "
+              f"({f['conversion_of_approved']:.1%} of approvals, "
+              f"{f['application_to_loan']:.1%} end to end)")
 
     # Reported, not gated -- the denominator convention is our reading.
     print(f"90+ incl. trailing-12m write-offs / trailing-12m disbursements "

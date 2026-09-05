@@ -86,6 +86,51 @@ RULES: tuple[Rule, ...] = (
          "encoding fault upstream that will corrupt any grouping on name",
          "merchant_name RLIKE '^[\\\\x20-\\\\x7E]+$'"),
 
+    # ---------------- applications ----------------
+    Rule("APPL_001", "applications", "COMPLETENESS", "REJECT", "ROW",
+         "Application id is mandatory",
+         "application_id IS NOT NULL AND application_id <> ''"),
+    Rule("APPL_002", "applications", "ACCURACY", "REJECT", "ROW",
+         "Decision must be a known code",
+         "decision IN ('APPROVED', 'DECLINED')"),
+    # NOTE the coalesce. Spark's CSV reader treats an empty field as NULL by
+    # default (`nullValue` is ""), so `lender_id = ''` is a comparison against
+    # NULL, which is UNKNOWN rather than TRUE -- and `_failed_rule_ids` treats an
+    # unevaluable rule as failed, on purpose. Written naively, this rule
+    # quarantined every application in the book. The pipeline was right and the
+    # rule was wrong, which is the good failure mode, but the lesson is that a
+    # rule distinguishing "absent" from "present" has to say which it means.
+    Rule("APPL_003", "applications", "CONSISTENCY", "REJECT", "ROW",
+         "Cross-element check: a declined application carries a reason and no "
+         "lender; an approved one carries a lender and no reason",
+         "(decision = 'DECLINED' AND coalesce(decline_reason, '') <> '' "
+         "AND coalesce(lender_id, '') = '') OR "
+         "(decision = 'APPROVED' AND coalesce(decline_reason, '') = '' "
+         "AND coalesce(lender_id, '') <> '')"),
+    Rule("APPL_004", "applications", "CONSISTENCY", "REJECT", "ROW",
+         "Only an approved application can convert into a loan",
+         "NOT (converted = 'Y' AND decision <> 'APPROVED')"),
+    Rule("APPL_005", "applications", "CONSISTENCY", "REJECT", "ROW",
+         "A converted application must name the loan it became, and an "
+         "unconverted one must not",
+         "(converted = 'Y' AND coalesce(loan_id, '') <> '') OR "
+         "(converted = 'N' AND coalesce(loan_id, '') = '')"),
+    Rule("APPL_006", "applications", "ACCURACY", "REJECT", "ROW",
+         "Cart amount must be strictly positive",
+         "cart_amount > 0"),
+    Rule("APPL_007", "applications", "TIMELINESS", "REJECT", "ROW",
+         "An application cannot be dated after the reporting date",
+         "applied_at <= reporting_date"),
+    Rule("APPL_008", "applications", "CONSISTENCY", "REJECT", "UNIQUENESS",
+         "Application id must be unique",
+         unique_key=("application_id",)),
+    Rule("APPL_009", "applications", "CONSISTENCY", "REJECT", "REFERENTIAL",
+         "Every application must belong to a known customer",
+         references=("customer_id", "customers", "customer_id")),
+    Rule("APPL_010", "applications", "CONSISTENCY", "WARN", "REFERENTIAL",
+         "Every application should originate at a known merchant",
+         references=("merchant_id", "merchants", "merchant_id")),
+
     # ---------------- loans ----------------
     Rule("LOAN_001", "loans", "COMPLETENESS", "REJECT", "ROW",
          "Loan id is mandatory",

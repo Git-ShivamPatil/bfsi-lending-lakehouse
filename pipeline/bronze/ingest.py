@@ -32,8 +32,14 @@ SOURCES: dict[str, list[str]] = {
         "customer_id", "city", "city_tier", "pincode", "age_band", "score_band",
         "bureau_score", "kyc_status", "created_at",
     ],
+    "applications": [
+        "application_id", "customer_id", "merchant_id", "channel", "applied_at",
+        "cart_amount", "tenure_months", "decision", "decline_reason",
+        "lender_id", "converted", "loan_id",
+    ],
     "loans": [
-        "loan_id", "customer_id", "merchant_id", "product", "principal",
+        "loan_id", "application_id", "customer_id", "merchant_id", "lender_id",
+        "product", "cart_amount", "down_payment", "principal",
         "tenure_months", "apr", "subvention_pct", "disbursed_at",
     ],
     "emi_schedule": [

@@ -34,10 +34,14 @@ from ..common import Layout, get_spark, write_table
 #: Target types per entity. Columns absent from a map stay strings.
 CASTS: dict[str, dict[str, str]] = {
     "customers": {"bureau_score": "INT", "created_at": "DATE"},
+    "applications": {
+        "applied_at": "DATE", "cart_amount": "DOUBLE", "tenure_months": "INT",
+    },
     "merchants": {"onboarded_at": "DATE"},
     "loans": {
         "principal": "DOUBLE", "tenure_months": "INT", "apr": "DOUBLE",
         "subvention_pct": "DOUBLE", "disbursed_at": "DATE",
+        "cart_amount": "DOUBLE", "down_payment": "DOUBLE",
     },
     "emi_schedule": {
         "instalment_no": "INT", "due_date": "DATE", "emi_amount": "DOUBLE",
@@ -52,6 +56,7 @@ CASTS: dict[str, dict[str, str]] = {
 #: Tie-breaker used when collapsing duplicate natural keys, per entity. Stable
 #: ordering is what makes the de-duplication reproducible run to run.
 DEDUPE_ORDER: dict[str, list[str]] = {
+    "applications": ["applied_at"],
     "loans": ["disbursed_at"],
     "emi_schedule": ["due_date"],
     "repayment_attempts": ["attempted_at", "status"],
@@ -164,7 +169,8 @@ def build(spark: SparkSession, layout: Layout, reporting_date: str) -> dict[str,
     # Parents must be cleaned before children can be checked against them,
     # otherwise a child row is validated against a customer that is itself about
     # to be quarantined.
-    order = ["customers", "merchants", "loans", "emi_schedule", "repayment_attempts"]
+    order = ["customers", "merchants", "applications", "loans",
+             "emi_schedule", "repayment_attempts"]
     clean_frames: dict[str, DataFrame] = {}
     quarantines = []
     counts: dict[str, int] = {}
@@ -193,10 +199,18 @@ def build(spark: SparkSession, layout: Layout, reporting_date: str) -> dict[str,
         clean_frames[entity] = spark.table(layout.table("silver", entity))
         counts[entity] = clean_frames[entity].count()
 
+        # `_corrupt_record` rides along into the quarantine rather than being
+        # dropped with the clean frame. It is the raw text of a row the CSV
+        # reader could not fit to the declared schema, and it is the only
+        # evidence of what the source actually sent -- which is exactly what
+        # someone needs six months later to tell an upstream team their extract
+        # is broken. A quarantine that records the rule but not the row is an
+        # audit trail with the interesting half missing.
         quarantines.append(
             bad.select("_entity", "_quarantined_at",
                        F.explode("_failed_rules").alias("rule_id"),
-                       F.col("_batch_id"))
+                       F.col("_batch_id"),
+                       F.col("_corrupt_record"))
         )
 
     q = quarantines[0]

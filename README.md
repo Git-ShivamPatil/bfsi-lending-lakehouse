@@ -91,9 +91,9 @@ Git folder and a notebook, not from `databricks bundle deploy`.
 flowchart LR
     G["<b>Generator</b><br/>pure stdlib, seeded<br/>150k loans"] --> L["<b>Landing</b><br/>Unity Catalog volume<br/>on the driver, or pushed by CI"]
     L --> B["<b>Bronze</b><br/>verbatim, all strings<br/>lineage stamped"]
-    B --> S["<b>Silver</b><br/>try_cast + 29 rules<br/>quarantine, not drop"]
+    B --> S["<b>Silver</b><br/>try_cast + 39 rules<br/>quarantine, not drop"]
     S --> N["<b>Snapshot</b><br/>day-end DPD stamping<br/>SMA-0/1/2, NPA"]
-    N --> D["<b>Gold</b><br/>roll rates, vintage,<br/>collections, DQ scorecard"]
+    N --> D["<b>Gold</b><br/>funnel, roll rates, vintage,<br/>FPD, collections, DQ scorecard"]
     S -.-> Q["<b>Quarantine</b><br/>every rejected row,<br/>with the rule it broke"]
     Q --> D
 ```
@@ -124,34 +124,59 @@ See [Cost](#cost-actually-zero).
 
 | | |
 |---|---|
-| Loans / customers / merchants | 150,000 · 105,000 · 1,400 |
-| EMI schedule rows | 1,124,484 |
-| Repayment attempts | 816,928 |
-| Raw extract size | 128 MB CSV |
-| Generation time | **64 s** on a 2-core i3, no third-party dependency |
-| Independent back-test | 43 s |
-| Open loans at as-of | 63,137 |
-| Principal outstanding | ₹13.16 crore |
-| Average ticket | ₹3,512 |
-| Written off (>180 DPD) | 3,888 loans, of which 3,355 in the last 12 months |
+| Applications / loans | 257,850 · 150,000 |
+| Customers / merchants | 105,000 · 1,400 |
+| EMI schedule rows | 1,123,464 |
+| Repayment attempts | 819,526 |
+| Raw extract size | 156 MB CSV |
+| Independent back-test | 45 s, no third-party dependency |
+| Open loans at as-of | 63,435 |
+| Principal outstanding | ₹13.36 crore |
+| Average ticket | ₹3,515 |
+| Written off (>180 DPD) | 4,487 loans, of which 3,750 in the last 12 months |
 
 **Portfolio position at 2026-08-31**
 
 | Bucket | Share of book by value | Loans |
 |---|---:|---:|
-| Current | 94.91% | 59,923 |
-| 1–30 DPD (SMA-0) | 1.59% | 846 |
-| 31–60 DPD (SMA-1) | 1.06% | 605 |
-| 61–90 DPD (SMA-2) | 0.61% | 412 |
-| 90+ DPD (NPA) | **1.84%** | 1,351 |
+| Current | 94.78% | 60,203 |
+| 1–30 DPD | 1.62% | 842 |
+| 31–60 DPD | 1.00% | 586 |
+| 61–90 DPD | 0.66% | 436 |
+| 90+ DPD | **1.94%** | 1,368 |
 
-Median monthly collection efficiency **97.4%**, bounce rate **3.4%** of attempts.
+Median monthly collection efficiency **96.5%**, bounce rate **4.3%** of attempts.
 
-The SMA labels line up with the DPD bands *at this date*. They would not at every
-date in the window — the NPA threshold for this entity was 120 days until
-31 Mar 2026 and 150 before that, so the regulatory classification and the 90+
-bucket disagree on purpose for most of the book's history. See
+These are **delinquency buckets, not regulatory classifications**, and the repo
+keeps them apart on purpose: the NPA threshold for this entity was 120 days until
+31 Mar 2026 and 150 before that, so `asset_classification` disagrees with the 90+
+bucket for most of the book's history. See
 [The NPA threshold is not 90 days](#the-npa-threshold-is-not-90-days).
+
+**The checkout funnel**
+
+| | |
+|---|---:|
+| Applications | 257,850 |
+| Approved | 192,394 — **74.6%** |
+| Disbursed | 150,000 — **78.0%** of approvals |
+| Application to loan | **58.2%** |
+
+The gap between approval and disbursal is the down payment: approved at
+checkout, then abandoned rather than paying the 25–33% up front. That is a
+product problem, not a credit one, and separating the two is the point of
+computing them apart.
+
+Declines break down as bureau score below cutoff 34.1%, existing delinquency
+18.8%, thin-file policy 16.0%, velocity limit 13.1%, KYC incomplete 11.0%,
+merchant not eligible 7.0%.
+
+Approval rate is stated on **decisioned** applications rather than on all
+applications received. Every application here carries a decision so the two
+coincide — but the query is written the careful way anyway, because where a
+decisioning lag exists, counting undecided applications as implicit rejections
+depresses the most recent month and gets read as a policy tightening that never
+happened.
 
 ### Why those numbers are the right ones
 
@@ -161,12 +186,24 @@ Pvt Ltd reports **GNPA of 2.0%** as at 31 Dec 2025. The generator targets it and
 CI fails the build if it drifts more than 60 bps:
 
 ```
-GNPA (90+ DPD over gross advances) 1.838% vs target 2.000%
-  (tolerance +/-0.600%) -> drift 0.162%
-Average ticket Rs 3,512 vs published Rs 3,500 (tolerance +/-Rs 400) -> drift Rs 12
-90+ incl. trailing-12m write-offs / trailing-12m disbursements 2.237%
+GNPA (90+ DPD over gross advances) 1.944% vs target 2.000%
+  (tolerance +/-0.600%) -> drift 0.056%
+Average ticket Rs 3,515 vs published Rs 3,500 (tolerance +/-Rs 400) -> drift Rs 15
+Funnel: 257,850 applications -> 192,394 approved (74.6%) -> 150,000 disbursed
+  (78.0% of approvals, 58.2% end to end)
+90+ incl. trailing-12m write-offs / trailing-12m disbursements 2.761%
   (CRISIL reports 2.7% at 31 Dec 2025 on its own denominator)
 ```
+
+**That last line is the one worth pausing on**, because nothing is tuned to it.
+The build gates on two figures — GNPA and average ticket. CRISIL's third
+published number, the write-off ratio on disbursements, is computed and reported
+but never optimised against. It read 2.24% before the generator learned that
+underwriting improves over time, and 2.761% after, against a published 2.7%.
+
+A held-out number landing on its published value is a different quality of
+evidence from a gated one hitting its target, and it is the closest thing to
+out-of-sample validation a synthetic book can offer.
 
 #### Reading the source is half the work
 
@@ -306,7 +343,7 @@ that exists, rather than given an invented label.
 
 ## The validation layer
 
-29 rules across 5 entities — 22 rejecting, 7 warning — held as **configuration rather than code** in
+39 rules across 6 entities — 31 rejecting, 8 warning — held as **configuration rather than code** in
 [`validation/rules.py`](validation/rules.py), so the rule set can be reviewed by
 someone who does not read PySpark. Each rule carries a data-quality dimension —
 Accuracy, Completeness, Timeliness, Consistency — the ACTC framing of RBI's
@@ -612,20 +649,18 @@ lending data is used, and none of it is scraped from anywhere.
   Modelling it would need a guarantee arrangement this book does not have.
 - **No streaming path.** Everything is batch. A CDC feed via Debezium into a
   bronze append would be closer to how a real lender ingests.
-- **The `_corrupt_record` column is dropped after silver** rather than being
-  retained for forensics. It should be kept with the quarantine.
-- **The bounce rate is not really a bounce rate.** It reads 3.4% of attempts,
-  where NACH debit returns across the Indian industry run far higher. The
-  model's hazard is the probability of *entering delinquency*, not of a single
-  failed presentation — a bounce that cures within the same cycle is never
-  emitted at all. The column name promises more than the model delivers.
-  Modelling presentation-level retries separately from delinquency entry is the
-  fix, and it would also give first-payment default an independent mechanism,
-  which [the analysis](docs/ANALYSIS.md) shows it currently lacks.
-- **Bounce reasons are sampled independently of collection mode**, so a
-  `SIGNATURE_MISMATCH` can be returned against a UPI autopay mandate. Harmless
-  to every metric computed here, and obviously wrong to anyone who has worked a
-  collections queue.
+- **The bounce rate is still not really a bounce rate.** It reads 4.3% of
+  attempts, where NACH debit returns across the Indian industry run far higher.
+  The model's hazard is the probability of *entering delinquency*, not of a
+  single failed presentation — a bounce that cures within the same cycle is
+  never emitted at all. Modelling presentation-level retries separately from
+  delinquency entry is the remaining fix. First-payment default no longer
+  depends on it: instalment one has its own failure mode now.
+- **Decline reasons are drawn from a fixed mix rather than from the policy that
+  produced the decline.** A rejected application gets a reason sampled from one
+  distribution, so the reason does not vary by bureau band the way it would if
+  a real rule engine had emitted it. The approval *rate* varies by band; the
+  reason for a given decline does not.
 - **The bundle has never been deployed.** It is schema-checked on every push
   and it is written to the serverless constraints, but the end-to-end run went
   through a Git folder and a notebook.

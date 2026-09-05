@@ -222,9 +222,16 @@ SCORE_BANDS = (
 #: It briefly went to 0.0016 while the project was matching a write-off-inclusive
 #: ratio against the plain GNPA -- two different measures, and the mistake made
 #: the book about three times too clean before the rating rationale was re-read
-#: word for word. Ticket size does not enter the hazard, so the two calibration
-#: gates are independent and can be tuned one at a time.
-BASE_INSTALMENT_MISS_RATE = 0.0075
+#: word for word.
+#:
+#: It has to be re-swept whenever a hazard *factor* is added, and it was: merchant
+#: risk, ticket risk and cohort drift all multiply into the same hazard, so
+#: introducing them moved GNPA even though none of them is a rate. Note also that
+#: the book is now sensitive to the merchant COUNT -- volume follows a power law,
+#: so fewer merchants means more concentration and a different effective risk.
+#: Calibrate at the shipped configuration (150,000 loans, 1,400 merchants) or the
+#: answer will not transfer.
+BASE_INSTALMENT_MISS_RATE = 0.0065
 
 #: Month-on-book shape for that hazard. Early-life defaults dominate a
 #: checkout-finance book: the first instalment carries mandate-registration
@@ -249,17 +256,39 @@ COLLECTION_MODES = (
     ("MANUAL", 0.11),
 )
 
-#: Bounce reason codes, sampled when a presentation fails. These mirror the
+#: Bounce reason codes, **conditioned on the collection mode**. These mirror the
 #: NPCI return-reason vocabulary in shape; the exact code set a lender sees
-#: depends on its sponsor bank, so treat these as representative.
-BOUNCE_REASONS = (
-    ("INSUFFICIENT_FUNDS", 0.61),
-    ("MANDATE_NOT_REGISTERED", 0.11),
-    ("ACCOUNT_CLOSED", 0.07),
-    ("PAYMENT_STOPPED", 0.06),
-    ("TECHNICAL_DECLINE", 0.09),
-    ("SIGNATURE_MISMATCH", 0.06),
-)
+#: depends on its sponsor bank, so treat them as representative.
+#:
+#: Conditioning matters and the earlier version got it wrong. Reasons were drawn
+#: from one pooled distribution regardless of mode, which produced
+#: SIGNATURE_MISMATCH returns against UPI autopay mandates -- an instrument that
+#: has no signature. It changed no metric in this repository, and it is exactly
+#: the detail that tells someone who has worked a collections queue that nobody
+#: modelled the payment rails.
+BOUNCE_REASONS_BY_MODE = {
+    "NACH": (
+        ("INSUFFICIENT_FUNDS", 0.63),
+        ("MANDATE_NOT_REGISTERED", 0.11),
+        ("ACCOUNT_CLOSED", 0.07),
+        ("PAYMENT_STOPPED", 0.06),
+        ("SIGNATURE_MISMATCH", 0.07),
+        ("TECHNICAL_DECLINE", 0.06),
+    ),
+    "UPI_AUTOPAY": (
+        ("INSUFFICIENT_FUNDS", 0.58),
+        ("MANDATE_NOT_REGISTERED", 0.14),
+        ("MANDATE_REVOKED", 0.11),
+        ("ACCOUNT_CLOSED", 0.05),
+        ("TECHNICAL_DECLINE", 0.12),
+    ),
+    "MANUAL": (
+        ("INSUFFICIENT_FUNDS", 0.54),
+        ("CUSTOMER_UNREACHABLE", 0.28),
+        ("PROMISE_TO_PAY_BROKEN", 0.13),
+        ("TECHNICAL_DECLINE", 0.05),
+    ),
+}
 
 #: Festive seasonality on origination volume, by calendar month (1 = January).
 #: Indian consumer-durable financing peaks across the Sep-Nov festive window.
@@ -268,6 +297,140 @@ MONTH_SEASONALITY = {
     1: 0.88, 2: 0.84, 3: 0.95, 4: 0.98, 5: 1.02, 6: 0.94,
     7: 0.92, 8: 1.05, 9: 1.34, 10: 1.62, 11: 1.28, 12: 1.06,
 }
+
+# --------------------------------------------------------------------------
+# The checkout funnel
+# --------------------------------------------------------------------------
+#
+# A book that starts at disbursal cannot answer the first two questions anyone
+# asks a checkout lender -- what share of applications we approve, and what share
+# of approvals actually convert. Both are in every Snapmint job advertisement,
+# and neither was computable here until applications were modelled.
+
+#: Applications per eventual loan. Everything upstream of disbursal is generated
+#: and then filtered, so approval rate and conversion fall out of the data rather
+#: than being asserted. Assumed.
+APPLICATIONS_PER_LOAN = 2.35
+
+#: Where the application came from. Assumed; a checkout lender is
+#: overwhelmingly at the merchant's checkout rather than in its own app.
+APPLICATION_CHANNELS = (
+    ("MERCHANT_CHECKOUT", 0.74),
+    ("APP", 0.19),
+    ("WEB", 0.07),
+)
+
+#: Approval probability by bureau band. A checkout lender approves thin files it
+#: would decline elsewhere, because the ticket is small and the merchant is
+#: taking part of the risk. Assumed, but the ordering is not arbitrary -- it has
+#: to reproduce the band mix in SCORE_BANDS after filtering.
+APPROVAL_RATE_BY_BAND = {
+    "800+": 0.94,
+    "750-799": 0.91,
+    "700-749": 0.86,
+    "650-699": 0.74,
+    "300-649": 0.52,
+    "NTC": 0.61,
+}
+
+#: Why an application was declined. Assumed, and deliberately not uniform: a
+#: decline reason distribution that is flat across bands is the tell that nobody
+#: modelled the policy.
+DECLINE_REASONS = (
+    ("BUREAU_SCORE_BELOW_CUTOFF", 0.34),
+    ("EXISTING_DELINQUENCY", 0.19),
+    ("THIN_FILE_POLICY", 0.16),
+    ("VELOCITY_LIMIT_BREACHED", 0.13),
+    ("KYC_INCOMPLETE", 0.11),
+    ("MERCHANT_NOT_ELIGIBLE", 0.07),
+)
+
+#: Of approved applications, the share that reach disbursal. The gap is the
+#: down payment: the customer is approved at checkout and then abandons rather
+#: than paying the 25-33% up front. Assumed.
+CHECKOUT_CONVERSION = 0.78
+
+#: Snapmint's own merchant-facing site states "Pay as little as 25% - 33% at the
+#: time of purchase and the rest in easy monthly installments/EMIs", so the
+#: financed amount is the cart value less this. Sourced as a range; the draw
+#: within it is assumed.
+DOWN_PAYMENT_RANGE = (0.25, 0.33)
+
+#: The app routes to several regulated entities, not only its own NBFC -- the
+#: privacy policy names six, of which Snapmint Financial Services Pvt Ltd is the
+#: captive one. Lenders are given neutral ids here rather than the real names:
+#: this is synthetic data, and attaching invented loan performance to a named
+#: bank would be indefensible however clearly the file is labelled.
+#: `L01` is the captive. Shares assumed.
+LENDERS = (
+    ("L01", 0.46),   # captive NBFC
+    ("L02", 0.16),
+    ("L03", 0.13),
+    ("L04", 0.11),
+    ("L05", 0.08),
+    ("L06", 0.06),
+)
+CAPTIVE_LENDER_ID = "L01"
+
+# --------------------------------------------------------------------------
+# Merchant concentration and merchant-level risk
+# --------------------------------------------------------------------------
+
+#: Merchant volume follows a power law, not a uniform draw. This matters more
+#: than it sounds: with uniform assignment the top ten merchants held ~1.2% of
+#: exposure, so no single partner could ever be a portfolio event and the
+#: merchant-risk table was a shape rather than a finding. A real checkout book
+#: concentrates hard into a few large brands. Assumed exponent.
+MERCHANT_VOLUME_ZIPF = 1.35
+
+#: Spread of merchant-level risk, as a lognormal multiplier on the borrower's
+#: own hazard. Without it, merchant is not a risk factor at all and every
+#: outlier in the merchant-risk table is sampling noise. Assumed.
+MERCHANT_RISK_LOG_SIGMA = 0.42
+
+#: Ticket size as a risk factor, expressed as the hazard multiplier at the top
+#: of the ticket range relative to the bottom. Larger tickets stretch a
+#: small-ticket borrower. Assumed, and modest -- the effect is real but it is
+#: not the dominant term.
+TICKET_RISK_GRADIENT = 1.55
+
+#: Underwriting drift by cohort: the hazard multiplier applied to the first
+#: origination month, decaying linearly to 1.0 at the last. Snapmint's published
+#: GNPA improved from 6.3% to 3.1% to 2.0% over FY24-9MFY26, so the early book
+#: was materially worse than the recent one. Without drift every vintage curve
+#: lies on top of every other and the triangle demonstrates method with no story
+#: in it. Calibrated to the direction of the published series; the magnitude is
+#: assumed.
+COHORT_DRIFT_START_MULTIPLIER = 1.85
+
+# --------------------------------------------------------------------------
+# First-instalment behaviour
+# --------------------------------------------------------------------------
+#
+# First-payment default has to be able to move independently of lifetime
+# default, or the two are the same signal measured twice. On a real checkout
+# book they separate, and the separation is the useful part: high FPD with
+# ordinary GNPA is an activation failure -- a mandate that never registered, a
+# first debit presented before the account was ready -- while ordinary FPD with
+# high GNPA is an underwriting failure. They call for opposite responses.
+
+#: Probability the e-mandate never activates in time for instalment one, by
+#: bureau band. New-to-credit borrowers are worst: it is their first mandate,
+#: often on a freshly opened account. Assumed.
+MANDATE_FAILURE_RATE = {
+    "800+": 0.006,
+    "750-799": 0.008,
+    "700-749": 0.013,
+    "650-699": 0.021,
+    "300-649": 0.028,
+    "NTC": 0.047,
+}
+
+#: Of mandates that fail at instalment one, the share that are fixed and go on
+#: to pay normally. A registration failure is an operational problem, so most of
+#: it is recoverable -- which is exactly why it must not be modelled as credit
+#: risk. Assumed.
+MANDATE_RECOVERY_RATE = 0.72
 
 #: Merchant category mix. Assumed, shaped to a checkout-finance book.
 MERCHANT_CATEGORIES = (

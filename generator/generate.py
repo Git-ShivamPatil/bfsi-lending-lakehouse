@@ -141,6 +141,36 @@ class Merchant:
     city_tier: str
     pincode: str
     onboarded_at: date
+    #: Share of origination volume. Drawn from a power law rather than uniformly,
+    #: so a handful of partners carry most of the book -- which is what makes
+    #: merchant concentration a portfolio risk rather than a tail one.
+    volume_weight: float = 1.0
+    #: Merchant-level hazard multiplier. Without it, merchant is not a risk
+    #: factor and every outlier in the merchant-risk table is sampling noise.
+    risk_multiplier: float = 1.0
+
+
+@dataclass
+class Application:
+    """One checkout attempt, approved or not.
+
+    The book used to begin at disbursal, which made approval rate and checkout
+    conversion -- the first two questions anyone asks a checkout lender --
+    uncomputable. Loans are now the surviving tail of this table.
+    """
+
+    application_id: str
+    customer_id: str
+    merchant_id: str
+    channel: str
+    applied_at: date
+    cart_amount: float
+    tenure_months: int
+    decision: str
+    decline_reason: str
+    lender_id: str
+    converted: bool
+    loan_id: str
 
 
 @dataclass
@@ -167,6 +197,14 @@ class Loan:
     apr: float
     subvention_pct: float
     disbursed_at: date
+    #: The application this loan came from, so the funnel joins end to end.
+    application_id: str = ""
+    #: Which of the six regulated entities booked it.
+    lender_id: str = ""
+    #: Cart value, and the share of it the customer paid at checkout. `principal`
+    #: is what was financed -- cart less down payment -- not the cart value.
+    cart_amount: float = 0.0
+    down_payment: float = 0.0
     schedule: list = field(default_factory=list)   # (due_date, emi, prin, intr)
     attempts: list = field(default_factory=list)   # repayment attempt rows
 
@@ -206,7 +244,34 @@ class BookGenerator:
                 city_tier=tier,
                 pincode=f"{rng.randint(110000, 855999)}",
                 onboarded_at=self.start - timedelta(days=rng.randint(0, 900)),
+                # Zipf on rank: merchant 1 carries far more than merchant 1000.
+                # Shuffled afterwards so volume does not correlate with the id,
+                # which would let a downstream query cheat.
+                volume_weight=1.0 / ((i + 1) ** C.MERCHANT_VOLUME_ZIPF),
+                risk_multiplier=math.exp(
+                    rng.gauss(0.0, C.MERCHANT_RISK_LOG_SIGMA)),
             ))
+
+        weights = [m.volume_weight for m in out]
+        rng.shuffle(weights)
+        for m, w in zip(out, weights):
+            m.volume_weight = w
+
+        # Normalise the risk multipliers so their VOLUME-WEIGHTED mean is exactly
+        # 1.0. Without this, merchant risk does not merely redistribute hazard
+        # across the book -- it adds some, by an amount that depends on which
+        # merchants happened to draw the large volume weights, and therefore on
+        # the merchant count and the seed.
+        #
+        # That broke calibration transfer: the same hazard constant produced
+        # 2.05% GNPA at 150,000 loans over 1,400 merchants and 3.1% at the
+        # 8,000-loan fixture, so no single constant could satisfy the gate at
+        # both sizes. A risk factor that changes the aggregate is a calibration
+        # bug wearing a modelling hat.
+        total_w = sum(m.volume_weight for m in out)
+        weighted_mean = sum(m.volume_weight * m.risk_multiplier for m in out) / total_w
+        for m in out:
+            m.risk_multiplier /= weighted_mean
         return out
 
     def customers(self, n: int) -> list[Customer]:
@@ -260,66 +325,168 @@ class BookGenerator:
         span = (add_months(chosen, 1) - chosen).days
         return chosen + timedelta(days=rng.randrange(span))
 
-    def loans(self, customers: list[Customer], merchants: list[Merchant]) -> list[Loan]:
+    def applications(self, customers: list[Customer], merchants: list[Merchant]):
+        """Generate the checkout funnel and return (applications, loans).
+
+        Loans are the surviving tail: applied -> approved -> converted. Approval
+        rate and checkout conversion therefore fall out of the data instead of
+        being asserted, which is the only way they are worth reporting.
+
+        Enough applications are generated to yield `n_loans` survivors, so the
+        loan count stays the headline parameter and the funnel widens above it.
+        """
         rng = self.rng
-        out = []
-        for i in range(self.n_loans):
+        band_of = {c.customer_id: c.score_band for c in customers}
+        merchant_weights = [(m, m.volume_weight) for m in merchants]
+
+        n_apps = int(self.n_loans * C.APPLICATIONS_PER_LOAN)
+        applications: list[Application] = []
+        loans: list[Loan] = []
+
+        for i in range(n_apps):
+            if len(loans) >= self.n_loans:
+                break
             cust = rng.choice(customers)
-            merch = rng.choice(merchants)
-
-            principal = math.exp(rng.gauss(C.TICKET_LOG_MEAN, C.TICKET_LOG_SIGMA))
-            principal = money(min(max(principal, C.TICKET_FLOOR), C.TICKET_CEILING))
-            if rng.random() < C.DEFECT_RATES["negative_principal"]:
-                principal = -principal
-                self.defects["negative_principal"] += 1
-
+            merch = weighted_choice(rng, merchant_weights)
+            applied = self._disbursal_date()
             tenure = rng.choice(C.TENURES_MONTHS)
-            no_cost = rng.random() < C.NO_COST_EMI_SHARE
-            apr = 0.0 if no_cost else round(rng.uniform(*C.APR_RANGE), 4)
-            subv = round(rng.uniform(*C.SUBVENTION_PCT_RANGE), 4) if no_cost else 0.0
 
-            disbursed = self._disbursal_date()
-            schedule_rows = amortise(abs(principal), apr, tenure)
-            schedule = []
-            for k, (emi, prin, intr) in enumerate(schedule_rows):
-                if rng.random() < C.DEFECT_RATES["emi_reconciliation_break"]:
-                    emi = money(emi * rng.uniform(1.03, 1.18))
-                    self.defects["emi_reconciliation_break"] += 1
-                schedule.append((add_months(disbursed, k + 1), emi, prin, intr))
+            cart = math.exp(rng.gauss(C.TICKET_LOG_MEAN, C.TICKET_LOG_SIGMA))
+            down_pct = rng.uniform(*C.DOWN_PAYMENT_RANGE)
+            # The published ticket figure is what gets financed, so the cart has
+            # to be grossed up by the down payment the customer pays at checkout.
+            cart = cart / (1.0 - down_pct)
+            cart = money(min(max(cart, C.TICKET_FLOOR), C.TICKET_CEILING / (1.0 - down_pct)))
 
-            out.append(Loan(
-                loan_id=f"L{i:08d}",
+            band = band_of[cust.customer_id]
+            approved = rng.random() < C.APPROVAL_RATE_BY_BAND[band]
+            converted = approved and rng.random() < C.CHECKOUT_CONVERSION
+
+            app_id = f"AP{i:09d}"
+            loan_id = ""
+
+            if converted:
+                loan_id = f"L{len(loans):08d}"
+                down = money(cart * down_pct)
+                principal = money(cart - down)
+                if rng.random() < C.DEFECT_RATES["negative_principal"]:
+                    principal = -principal
+                    self.defects["negative_principal"] += 1
+
+                no_cost = rng.random() < C.NO_COST_EMI_SHARE
+                apr = 0.0 if no_cost else round(rng.uniform(*C.APR_RANGE), 4)
+                subv = round(rng.uniform(*C.SUBVENTION_PCT_RANGE), 4) if no_cost else 0.0
+
+                schedule_rows = amortise(abs(principal), apr, tenure)
+                schedule = []
+                for k, (emi, prin, intr) in enumerate(schedule_rows):
+                    if rng.random() < C.DEFECT_RATES["emi_reconciliation_break"]:
+                        emi = money(emi * rng.uniform(1.03, 1.18))
+                        self.defects["emi_reconciliation_break"] += 1
+                    schedule.append((add_months(applied, k + 1), emi, prin, intr))
+
+                loans.append(Loan(
+                    loan_id=loan_id,
+                    customer_id=cust.customer_id,
+                    merchant_id=merch.merchant_id,
+                    product="NO_COST_EMI" if no_cost else "INTEREST_BEARING_EMI",
+                    principal=principal,
+                    tenure_months=tenure,
+                    apr=apr,
+                    subvention_pct=subv,
+                    disbursed_at=applied,
+                    application_id=app_id,
+                    lender_id=weighted_choice(rng, C.LENDERS),
+                    cart_amount=cart,
+                    down_payment=down,
+                    schedule=schedule,
+                ))
+
+            applications.append(Application(
+                application_id=app_id,
                 customer_id=cust.customer_id,
                 merchant_id=merch.merchant_id,
-                product="NO_COST_EMI" if no_cost else "INTEREST_BEARING_EMI",
-                principal=principal,
+                channel=weighted_choice(rng, C.APPLICATION_CHANNELS),
+                applied_at=applied,
+                cart_amount=cart,
                 tenure_months=tenure,
-                apr=apr,
-                subvention_pct=subv,
-                disbursed_at=disbursed,
-                schedule=schedule,
+                decision="APPROVED" if approved else "DECLINED",
+                decline_reason="" if approved else weighted_choice(rng, C.DECLINE_REASONS),
+                lender_id=weighted_choice(rng, C.LENDERS) if approved else "",
+                converted=converted,
+                loan_id=loan_id,
             ))
-        return out
+
+        return applications, loans
+
+    def loans(self, customers: list[Customer], merchants: list[Merchant]) -> list[Loan]:
+        """Backwards-compatible entry point: the loans out of the funnel."""
+        return self.applications(customers, merchants)[1]
 
     # -- repayment behaviour ----------------------------------------------
 
-    def simulate(self, loans: list[Loan], by_customer: dict[str, Customer]):
+    def simulate(self, loans: list[Loan], by_customer: dict[str, Customer],
+                 by_merchant: list[Merchant] | None = None):
         """Walk each loan's schedule and emit repayment attempts.
 
         The state machine is deliberately simple and legible: an account is either
         current or delinquent. A current account misses an instalment with a
-        hazard scaled by bureau band, city tier and month-on-book; a delinquent
-        account cures with a probability that falls as it ages, which is what
-        produces a realistic roll-rate matrix downstream.
+        hazard scaled by bureau band, city tier, merchant, ticket size, cohort
+        and month-on-book; a delinquent account cures with a probability that
+        falls as it ages, which is what produces a realistic roll-rate matrix
+        downstream.
+
+        Instalment one has its own failure mode on top of that hazard -- the
+        e-mandate may never have activated. That is deliberately modelled as an
+        operational event rather than a credit one, and most of it recovers, so
+        first-payment default can move independently of lifetime default. When
+        the two are the same signal measured twice, the segment cut that
+        distinguishes an onboarding problem from an underwriting one is not
+        available.
         """
         rng = self.rng
         pd_by_band = {b: m for b, _, _, m in C.SCORE_BANDS}
         risk_by_tier = {t: r for t, _, r in C.CITY_TIERS}
+        merchant_risk = {m: 1.0 for m in set(l.merchant_id for l in loans)}
+        if by_merchant:
+            merchant_risk = {m.merchant_id: m.risk_multiplier for m in by_merchant}
         attempt_seq = 0
+
+        # Ticket risk is expressed relative to the median, so the gradient does
+        # not quietly rescale the whole book's hazard when the ticket
+        # distribution moves.
+        median_ticket = math.exp(C.TICKET_LOG_MEAN)
+        months_span = max(1, self.months - 1)
 
         for loan in loans:
             cust = by_customer[loan.customer_id]
-            hazard_scale = pd_by_band[cust.score_band] * risk_by_tier[cust.city_tier]
+
+            # Underwriting drift: the earliest cohorts are worse. Without this
+            # every vintage curve sits on top of every other one and the
+            # triangle demonstrates method on a portfolio with no story in it.
+            age_months = ((loan.disbursed_at.year - self.start.year) * 12
+                          + loan.disbursed_at.month - self.start.month)
+            drift = C.COHORT_DRIFT_START_MULTIPLIER + (
+                (1.0 - C.COHORT_DRIFT_START_MULTIPLIER) * min(1.0, age_months / months_span))
+
+            # Ticket size as a risk factor, interpolated in log space between the
+            # floor and the ceiling of the gradient.
+            ratio = max(0.25, min(4.0, abs(loan.principal) / median_ticket))
+            ticket_risk = C.TICKET_RISK_GRADIENT ** (math.log(ratio) / math.log(4.0))
+
+            hazard_scale = (pd_by_band[cust.score_band]
+                            * risk_by_tier[cust.city_tier]
+                            * merchant_risk.get(loan.merchant_id, 1.0)
+                            * ticket_risk
+                            * drift)
+
+            # The e-mandate may simply never activate in time for instalment one.
+            # This is an operational failure, not a credit one, and most of it is
+            # recoverable -- which is what lets first-payment default move
+            # independently of lifetime default downstream.
+            mandate_failed = rng.random() < C.MANDATE_FAILURE_RATE[cust.score_band]
+            mandate_recovers = mandate_failed and rng.random() < C.MANDATE_RECOVERY_RATE
+
             delinquent_since = None   # index of the oldest unpaid instalment
 
             for idx, (due, emi, _prin, _intr) in enumerate(loan.schedule):
@@ -330,6 +497,28 @@ class BookGenerator:
                 attempt_seq += 1
 
                 if delinquent_since is None:
+                    # Instalment one, mandate never activated. Emitted with its
+                    # own reason code so the failure is attributable downstream
+                    # rather than looking like an ordinary miss.
+                    if idx == 0 and mandate_failed:
+                        loan.attempts.append(self._attempt(
+                            attempt_seq, loan, idx, due, emi, "NACH",
+                            "BOUNCED", due, rng,
+                            reason_override="MANDATE_NOT_REGISTERED"))
+                        if mandate_recovers:
+                            # Registration is fixed and the instalment settles
+                            # late. The account never enters delinquency.
+                            attempt_seq += 1
+                            fixed = due + timedelta(days=rng.randint(4, 25))
+                            if fixed > self.as_of:
+                                fixed = self.as_of
+                            loan.attempts.append(self._attempt(
+                                attempt_seq, loan, idx, due, emi, "MANUAL",
+                                "SUCCESS", fixed, rng))
+                        else:
+                            delinquent_since = idx
+                        continue
+
                     hazard = min(0.95, C.BASE_INSTALMENT_MISS_RATE * hazard_scale * mob)
                     if rng.random() < hazard:
                         delinquent_since = idx
@@ -377,8 +566,17 @@ class BookGenerator:
                 return label
         return "90+"
 
-    def _attempt(self, seq, loan, idx, due, emi, mode, status, event_date, rng):
-        reason = weighted_choice(rng, C.BOUNCE_REASONS) if status == "BOUNCED" else ""
+    def _attempt(self, seq, loan, idx, due, emi, mode, status, event_date, rng,
+                 reason_override: str = ""):
+        # Reasons are drawn per collection mode, not from one pooled list: a UPI
+        # autopay mandate cannot return SIGNATURE_MISMATCH, and a manual follow-up
+        # cannot return MANDATE_NOT_REGISTERED.
+        if status != "BOUNCED":
+            reason = ""
+        elif reason_override:
+            reason = reason_override
+        else:
+            reason = weighted_choice(rng, C.BOUNCE_REASONS_BY_MODE[mode])
         paid_at = event_date
 
         if status == "SUCCESS" and rng.random() < C.DEFECT_RATES["future_dated_repayment"]:
@@ -437,10 +635,23 @@ def main(argv=None) -> int:
 
     merchants = gen.merchants(args.merchants)
     customers = gen.customers(n_cust)
-    loans = gen.loans(customers, merchants)
-    gen.simulate(loans, {c.customer_id: c for c in customers})
+    applications, loans = gen.applications(customers, merchants)
+    gen.simulate(loans, {c.customer_id: c for c in customers}, merchants)
 
     out = Path(args.out)
+
+    write_csv(out / "applications.csv", (
+        {"application_id": a.application_id, "customer_id": a.customer_id,
+         "merchant_id": a.merchant_id, "channel": a.channel,
+         "applied_at": a.applied_at.isoformat(),
+         "cart_amount": f"{a.cart_amount:.2f}",
+         "tenure_months": a.tenure_months, "decision": a.decision,
+         "decline_reason": a.decline_reason, "lender_id": a.lender_id,
+         "converted": "Y" if a.converted else "N", "loan_id": a.loan_id}
+        for a in applications),
+        ["application_id", "customer_id", "merchant_id", "channel", "applied_at",
+         "cart_amount", "tenure_months", "decision", "decline_reason",
+         "lender_id", "converted", "loan_id"])
 
     write_csv(out / "merchants.csv", (
         {"merchant_id": m.merchant_id, "merchant_name": m.merchant_name,
@@ -460,13 +671,17 @@ def main(argv=None) -> int:
          "bureau_score", "kyc_status", "created_at"])
 
     write_csv(out / "loans.csv", (
-        {"loan_id": l.loan_id, "customer_id": l.customer_id,
-         "merchant_id": l.merchant_id, "product": l.product,
+        {"loan_id": l.loan_id, "application_id": l.application_id,
+         "customer_id": l.customer_id, "merchant_id": l.merchant_id,
+         "lender_id": l.lender_id, "product": l.product,
+         "cart_amount": f"{l.cart_amount:.2f}",
+         "down_payment": f"{l.down_payment:.2f}",
          "principal": f"{l.principal:.2f}", "tenure_months": l.tenure_months,
          "apr": f"{l.apr:.4f}", "subvention_pct": f"{l.subvention_pct:.4f}",
          "disbursed_at": l.disbursed_at.isoformat()}
         for l in loans),
-        ["loan_id", "customer_id", "merchant_id", "product", "principal",
+        ["loan_id", "application_id", "customer_id", "merchant_id", "lender_id",
+         "product", "cart_amount", "down_payment", "principal",
          "tenure_months", "apr", "subvention_pct", "disbursed_at"])
 
     def schedule_rows():
@@ -504,9 +719,21 @@ def main(argv=None) -> int:
         "counts": {
             "merchants": len(merchants),
             "customers": len(customers),
+            "applications": len(applications),
             "loans": len(loans),
             "emi_schedule": sum(len(l.schedule) for l in loans),
             "repayment_attempts": sum(len(l.attempts) for l in loans),
+        },
+        "funnel": {
+            "applications": len(applications),
+            "approved": sum(1 for a in applications if a.decision == "APPROVED"),
+            "converted": sum(1 for a in applications if a.converted),
+            "approval_rate": round(
+                sum(1 for a in applications if a.decision == "APPROVED")
+                / len(applications), 5) if applications else 0.0,
+            "conversion_of_approved": round(
+                sum(1 for a in applications if a.converted)
+                / max(1, sum(1 for a in applications if a.decision == "APPROVED")), 5),
         },
         "injected_defects": gen.defects,
     }
