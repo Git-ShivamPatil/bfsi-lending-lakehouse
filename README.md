@@ -1,6 +1,6 @@
 # BFSI Lending Lakehouse
 
-Roll-rate matrices, vintage triangles, delinquency buckets and an IND-AS 109
+Roll-rate matrices, vintage triangles, delinquency buckets and an Ind AS 109
 provision for an Indian no-cost-EMI / checkout-finance book — computed twice,
 independently, and calibrated against a figure the lender's rating agency
 actually published.
@@ -141,6 +141,12 @@ See [Cost](#cost-actually-zero).
 
 Median monthly collection efficiency **97.4%**, bounce rate **3.4%** of attempts.
 
+The SMA labels line up with the DPD bands *at this date*. They would not at every
+date in the window — the NPA threshold for this entity was 120 days until
+31 Mar 2026 and 150 before that, so the regulatory classification and the 90+
+bucket disagree on purpose for most of the book's history. See
+[The NPA threshold is not 90 days](#the-npa-threshold-is-not-90-days).
+
 ### Why those numbers are the right ones
 
 The book is calibrated against a published figure, not tuned until it looked
@@ -254,15 +260,60 @@ anywhere.
 
 ---
 
+## The NPA threshold is not 90 days
+
+Almost every synthetic lending book stamps NPA at 90 days past due. For the
+entity this one models, that was wrong for most of the window it covers.
+
+The RBI (NBFC – IRACP) Directions, 2025 set the Base Layer rule at **more than
+180 days** (para 43), and phase it down (para 44):
+
+| From | NPA at |
+|---|---|
+| 31 Mar 2024 | more than 150 days |
+| 31 Mar 2025 | more than 120 days |
+| 31 Mar 2026 | more than 90 days |
+
+Middle and Upper Layer NBFCs are at 90 days unconditionally. The layer test is
+**asset size, not AUM** — Base Layer is non-deposit-taking NBFCs below ₹1,000
+crore of *assets* — and the modelled entity sits there on ~₹938 crore of total
+assets, not on its ~₹615 crore AUM. Reaching the right layer by the wrong
+measure is the kind of thing that gets asked about.
+
+A book running from Sep 2024 to Aug 2026 therefore crosses two of those steps.
+`asset_classification` follows the threshold in force on each snapshot date and
+emits it as a column, so a reviewer can see which rule was applied to which date
+without re-deriving it — and an account 100 days overdue in 2025 is correctly
+**not** an NPA.
+
+The delinquency measures do *not* move with it. `dpd_bucket`, GNPA and PAR-90
+stay on a fixed 90 days, because that is the basis the published figure the book
+is calibrated against is stated on. Two questions, two definitions, kept apart:
+conflating a regulatory classification with a risk metric is how a book ends up
+reconciling to neither.
+
+There is one honest edge. The SMA table stops at 90 days, but the Base Layer NPA
+threshold was above 90 for most of this window — so an account 100 days overdue
+in 2025 is past the end of the SMA table and not yet an NPA, a band the
+instruments simply do not name. It is reported as SMA-2, the deepest category
+that exists, rather than given an invented label.
+
 ## The validation layer
 
 29 rules across 5 entities — 22 rejecting, 7 warning — held as **configuration rather than code** in
 [`validation/rules.py`](validation/rules.py), so the rule set can be reviewed by
 someone who does not read PySpark. Each rule carries a data-quality dimension —
-Accuracy, Completeness, Timeliness, Consistency — which is the ACTC framing RBI
-uses in its Supervisory Data Quality Index.
+Accuracy, Completeness, Timeliness, Consistency — the ACTC framing of RBI's
+**Supervisory Data Quality Index**, which scores returns on exactly those four.
 
-Three ideas borrowed from how regulatory return validation genuinely works:
+One qualification, because being loose here is the kind of thing that gets
+noticed: sDQI is a *supervisory* measure applied to scheduled commercial banks'
+returns, assessing adherence to the Master Direction on Filing of Supervisory
+Returns, 2024. An NBFC is not scored on it. The dimensions are borrowed as a
+framing a reader in Indian banking will recognise — not as a claim that the
+index applies to this book.
+
+Three ideas from how regulatory return validation genuinely works:
 
 - **Element-level and cross-element checks are different things.** A value can be
   individually valid and still contradict another field (`emi_amount` ≠
@@ -307,7 +358,7 @@ every write.
 
 ## Expected credit loss
 
-[`ECL_SQL`](pipeline/gold/metrics.py) stages the book under IND-AS 109 —
+[`ECL_SQL`](pipeline/gold/metrics.py) stages the book under Ind AS 109 —
 Stage 1 (≤30 DPD, 12-month ECL), Stage 2 (31–90, lifetime), Stage 3 (90+,
 credit-impaired) — and computes a provision as EAD × PD × LGD. Tests assert the
 staging partitions the book exactly once and that coverage rises with stage.
@@ -316,6 +367,14 @@ The PD and LGD inputs are **assumptions and the weakest numbers in the repo**: a
 real implementation derives PD from the observed roll-rate matrix and LGD from
 realised recoveries, neither of which this book models. The staging is real; the
 provision figure has the right shape but is not quotable.
+
+There is also a structural point this staging does not model, and it is the one a
+sophisticated reader raises first. For an NBFC reporting under Ind AS, the IRACP
+requirements are a **prudential floor, not the booked number**: the entity holds
+Ind AS expected-credit-loss impairment allowances *and* computes the IRACP
+provision in parallel, with the higher amount binding (RBI (NBFC – IRACP)
+Directions, 2025, para 34). A repo that computed an ECL and called it "the
+provision" would be describing only one of the two numbers a real NBFC carries.
 
 ## The SQL exercises
 
@@ -470,11 +529,44 @@ attached at all. The two signup doors look nearly identical and both say "free".
 
 Being precise about this is the point of the project, not a disclaimer.
 
-**Sourced, with references in [`generator/config.py`](generator/config.py):** the
-2.0% GNPA target (CRISIL, Snapmint Financial Services Pvt Ltd, 16 Apr 2026);
-RBI SMA-0/1/2 day-count bands and the day-end stamping rule from the IRACP
-clarification of 12 Nov 2021; the 5% Default Loss Guarantee cap from the RBI
-(Digital Lending) Directions, 2025.
+**Sourced**, each traceable to a named instrument rather than to "RBI says":
+
+| Claim | Instrument |
+|---|---|
+| GNPA 2.0% and average ticket ₹3,500 | CRISIL Ratings, Snapmint Financial Services Pvt Ltd, 16 Apr 2026 |
+| Day-end stamping; upgrade only on full arrears; NPA glide path | **RBI/DOR/2025-26/356**, RBI (NBFC – Income Recognition, Asset Classification and Provisioning) Directions, 2025, 28 Nov 2025, paras 18, 19, 24, 43, 44 |
+| SMA-0/1/2 day-count bands | **RBI/DOR/2025-26/357**, RBI (NBFC – Resolution of Stressed Assets) Directions, 2025, 28 Nov 2025, para 18 |
+| 5% Default Loss Guarantee cap | **RBI/DOR/2025-26/347**, RBI (NBFC – Credit Facilities) Directions, 2025, 28 Nov 2025, Ch. III para 24(1) |
+| Reporting DLAs to the CIMS portal | **RBI/DOR/2025-26/347**, Ch. III para 18 — originally para 17(i) of the Digital Lending Directions, 2025, whose 15 Jun 2025 cut-off was a one-time transitional |
+
+Those citations were all wrong until they were checked, and the way they were
+wrong is worth more than the fact that they are now right.
+
+**Every instrument this project originally cited has been withdrawn.** On
+28 Nov 2025 the RBI consolidated its rulebook: circular RBI/2025-26/100 withdrew
+**9,445 circulars** and replaced them with 244 Master Directions. The IRACP
+Master Circular, the 12 Nov 2021 clarification the snapshot logic was built on,
+and the Scale Based Regulation Master Direction, 2023 are all on the withdrawn
+list — rows 282, 273 and 44 of its Annex. Everything survived in substance;
+nothing survived by name.
+
+**Three separate instruments, not one.** The rules this pipeline implements are
+split across the IRACP Directions (day-end, upgrade, NPA), the Resolution of
+Stressed Assets Directions (the SMA table) and the Credit Facilities Directions
+(DLG). "The IRACP master circular" was never the source of the SMA table even
+before the consolidation — that came from the June 2019 Prudential Framework.
+
+**The bank rule is not the NBFC rule.** The two-column "loans other than
+revolving facilities" SMA table belongs to the *bank* instrument; the NBFC table
+is a single column and has no such split. Sub-standard runs 18 months for a Base
+Layer NBFC against 12 for a bank, and the doubtful ladder is 20/30/50 against the
+bank's 25/40/100. Quoting a bank number at an NBFC interviewer is a specific and
+recognisable way to lose the room.
+
+The provisions actually relied on are quoted verbatim in
+[`pipeline/silver/snapshot.py`](pipeline/silver/snapshot.py) and
+[`generator/config.py`](generator/config.py), because paraphrasing a regulation
+is how the paraphrase becomes the requirement.
 
 **Assumptions, labelled as such:** ticket-size distribution, bureau-band mix and
 their PD multipliers, cure rates by bucket, festive seasonality, merchant
@@ -497,10 +589,21 @@ lending data is used, and none of it is scraped from anywhere.
 - **ECL staging keys off DPD alone.** A real implementation also stages on
   qualitative triggers — restructuring, forbearance, watch-list — and on
   relative PD deterioration since origination, not only an absolute day count.
-- **No Default Loss Guarantee modelling.** The RBI (Digital Lending) Directions,
-  2025 cap DLG at 5% of the disbursed portfolio, but this book has no lending
-  service provider and no guarantee arrangement, so there is nothing honest to
-  compute. A constant for the cap was removed rather than given an invented use.
+- **No Default Loss Guarantee modelling.** For an NBFC the cap lives in
+  Ch. III para 24(1) of the RBI (NBFC – Credit Facilities) Directions, 2025:
+  DLG cover specified upfront "shall not exceed five per cent of the total
+  amount disbursed out of that loan portfolio at any given time". Two details
+  worth reading twice — the denominator is *disbursements*, not outstandings,
+  and the 2023 guidelines said "the amount of that loan portfolio", which is a
+  materially wider base. This book has no lending service provider and no
+  guarantee arrangement, so there is nothing honest to compute, and a constant
+  for the cap was removed rather than given an invented use.
+
+  Since 13 Feb 2026 this is no longer purely academic for a lender like the one
+  modelled: the RBI (NBFC – IRACP) Amendment Directions, 2026 inserted paras
+  36A–36C letting an NBFC take DLG cover into account when computing expected
+  credit loss, and requiring staging to be recomputed as that cover depletes.
+  Modelling it would need a guarantee arrangement this book does not have.
 - **No streaming path.** Everything is batch. A CDC feed via Debezium into a
   bronze append would be closer to how a real lender ingests.
 - **The `_corrupt_record` column is dropped after silver** rather than being

@@ -1,16 +1,31 @@
 """A configurable validation-rule repository for the lending book.
 
 Modelled on how regulatory return validation actually works rather than on how
-data-quality tooling usually markets itself. Three ideas are borrowed directly
-from RBI's published CIMS design material and its supervisory data-quality work:
+data-quality tooling usually markets itself. Three ideas shape it, and it is
+worth being precise about which of them is borrowed and which is a design choice
+of this project:
+
+* **every rule is tagged with a data-quality dimension** -- Accuracy,
+  Completeness, Timeliness, Consistency. This is the ACTC framing of RBI's
+  **Supervisory Data Quality Index (sDQI)**, which scores returns on exactly
+  those four dimensions.
+
+  One qualification, because the distinction matters to anyone who works with
+  these instruments: sDQI is a *supervisory* measure applied to scheduled
+  commercial banks' returns, assessing adherence to the Master Direction on
+  Filing of Supervisory Returns, 2024. It is not something an NBFC is scored on,
+  and this project is not claiming otherwise. The four dimensions are borrowed
+  as a framing because they are a good one and because a reader in Indian
+  banking will recognise them -- not because the index applies here.
+
+* **element-level and cross-element checks are different things** -- a value can
+  be individually valid and still contradict another field in the same row, or a
+  row in another entity. That distinction is ordinary practice in regulatory
+  return validation rather than a citation, and it is the reason `Kind` exists.
 
 * **rules live as configuration, not code** -- adding a check is adding a row
-  here, so the rule set can be reviewed by someone who does not read PySpark;
-* **element-level and cross-element checks are different things** -- a value can
-  be individually valid and still contradict another field, or another return;
-* **every rule is tagged with a data-quality dimension** -- Accuracy,
-  Completeness, Timeliness, Consistency, which is the ACTC framing RBI's
-  Supervisory Data Quality Index uses.
+  here, so the rule set can be reviewed by someone who does not read PySpark.
+  That is a design decision made for this repository, not an inherited one.
 
 Severity is the other axis. REJECT quarantines the row so it never reaches the
 gold layer; WARN lets it through but counts it, because a lender that dropped

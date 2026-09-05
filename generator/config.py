@@ -47,15 +47,71 @@ GNPA_WRITE_OFF_LOOKBACK_DAYS = 365
 #: denominator and says so. Reported for shape, not matched to a target.
 TARGET_WRITE_OFF_RATIO_ON_DISBURSEMENTS = 0.027
 
-#: RBI SMA buckets for loans other than revolving facilities. Days-past-due
-#: ranges per the IRACP master circular and the RBI clarification of
-#: 12 Nov 2021, which also fixed that classification happens as part of the
-#: day-end process and is stamped with the calendar date that process is run for.
+#: Special-mention-account tagging. The SMA table for an NBFC lives in the
+#: **Reserve Bank of India (Non-Banking Financial Companies - Resolution of
+#: Stressed Assets) Directions, 2025** -- RBI/DOR/2025-26/357,
+#: DOR.STR.REC.276/21.04.048/2025-26, 28 November 2025 -- at para 18:
+#:
+#:     A NBFC shall recognise incipient stress in loan accounts, immediately on
+#:     default, by classifying such assets as special mention accounts (SMA) as
+#:     per the following categories:
+#:         SMA-0   Up to 30 days
+#:         SMA-1   More than 30 days and up to 60 days
+#:         SMA-2   More than 60 days and up to 90 days
+#:
+#: Two details this project got wrong before checking, both of which are the
+#: bank/NBFC conflation an interviewer looks for:
+#:
+#: * The SMA table is **not** in the IRACP instrument, and never was -- it comes
+#:   from the resolution-of-stressed-assets line, originally the June 2019
+#:   Prudential Framework. IRACP (RBI/DOR/2025-26/356) carries the NPA rules.
+#: * There is **no "loans other than revolving facilities" qualifier for an
+#:   NBFC**. The word "revolving" appears in neither 2025 NBFC instrument; the
+#:   two-column split is the *bank* table (RBI/DOR/2025-26/165, para 15). The
+#:   NBFC table is a single column keyed only on days overdue.
+#:
+#: The day counts are stated as inclusive integer ranges here because that is
+#: what the code needs; RBI's own boundary wording is "up to" / "more than ...
+#: and up to", which coincides for whole days.
 SMA_BUCKETS = (
     ("SMA-0", 1, 30),
     ("SMA-1", 31, 60),
     ("SMA-2", 61, 90),
 )
+
+#: Days overdue at which an asset becomes an NPA -- **and it is not simply 90
+#: for this entity.** Para 43 of the IRACP Directions, 2025 (RBI/DOR/2025-26/356,
+#: DOR.STR.REC.No.275/21.04.048/2025-26, 28 November 2025, updated to 1 July
+#: 2026) sets the NBFC-Base-Layer threshold at more than 180 days, and para 44
+#: phases it down:
+#:
+#:     more than 150 days   by 31 March 2024
+#:     more than 120 days   by 31 March 2025
+#:     more than  90 days   by 31 March 2026
+#:
+#: NBFC-Middle and Upper Layer are at 90 days already (para 51). The layer test
+#: is **asset size, not AUM** -- Base Layer is non-deposit-taking NBFCs below
+#: Rs 1,000 crore of assets (Scale Based Regulation Directions, 2025,
+#: RBI/DOR/2025-26/339, para 10) -- and the modelled entity sits there on
+#: ~Rs 938 crore of total assets, not on its ~Rs 615 crore AUM. Reaching the
+#: right layer by the wrong measure is a standard interview trap.
+#:
+#: So a book spanning 2024-2026 cannot stamp NPA at 90 days throughout without
+#: being anachronistic for most of its own window. `NPA_DPD_GLIDE_PATH` is
+#: applied by `pipeline/silver/snapshot.py` to `asset_classification`.
+NPA_DPD_GLIDE_PATH = (
+    ("2024-03-31", 150),
+    ("2025-03-31", 120),
+    ("2026-03-31", 90),
+)
+
+#: The fixed 90-day threshold, used for the *delinquency* measures -- the 90+
+#: bucket, GNPA, PAR-90 -- as distinct from regulatory asset classification.
+#: This is deliberate rather than lazy: CRISIL reports Snapmint's GNPA on a 90+
+#: dpd basis, and the calibration gate compares against that figure, so the risk
+#: metric has to stay on a fixed 90 days even while the regulatory
+#: classification follows the glide path above. The two answer different
+#: questions and the repo keeps them apart.
 NPA_DPD_THRESHOLD = 90
 
 #: Days past due at which an account is written off and leaves the active book.
@@ -86,7 +142,7 @@ DPD_BUCKETS = (
 #: Tenures Snapmint documents on its own product pages.
 TENURES_MONTHS = (3, 6, 9, 12)
 
-#: IND-AS 109 expected-credit-loss staging, keyed off days past due.
+#: Ind AS 109 expected-credit-loss staging, keyed off days past due.
 #: Stage 1 is performing (12-month ECL); Stage 2 is a significant increase in
 #: credit risk (lifetime ECL); Stage 3 is credit-impaired, which lines up with
 #: the 90-DPD NPA threshold above.

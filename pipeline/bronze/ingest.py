@@ -68,9 +68,11 @@ def read_source(spark: SparkSession, root: str, name: str) -> DataFrame:
 def add_lineage(df: DataFrame, batch_id: str, generator_version: str) -> DataFrame:
     """Stamp every row with where it came from and when it arrived.
 
-    RBI's own CIMS design documents describe end-to-end data lineage as a
-    requirement rather than a nicety; the same idea applies to any pipeline that
-    has to defend a number to a regulator six months later.
+    Not cited to anything, because it does not need to be: a pipeline that has to
+    defend a number to a regulator six months after it was filed needs to be able
+    to say which file the number came from, which batch loaded it and which
+    version of the producer wrote it. The four columns below are the cheapest
+    possible version of that, and they cost one pass over data already in memory.
     """
     return (
         # `_metadata.file_path`, not `input_file_name()`. The latter was removed

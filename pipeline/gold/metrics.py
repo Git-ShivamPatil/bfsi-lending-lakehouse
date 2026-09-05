@@ -289,7 +289,7 @@ FROM   per_merchant
 """
 
 # ---------------------------------------------------------------------------
-# IND-AS 109 expected credit loss
+# Ind AS 109 expected credit loss
 # ---------------------------------------------------------------------------
 #
 # Staging is a pure function of DPD here, which is the simplification worth being

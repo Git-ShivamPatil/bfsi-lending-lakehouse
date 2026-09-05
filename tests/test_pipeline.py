@@ -52,9 +52,28 @@ def silver(spark, raw_views):
 def snapshot(spark, silver):
     SN.month_ends(spark, "2024-09-30", REPORTING_DATE).createOrReplaceTempView(
         "snapshot_dates")
-    df = spark.sql(SN.SNAPSHOT_SQL.format(write_off_dpd=180)).cache()
+    df = spark.sql(SN.snapshot_sql(180)).cache()
     df.createOrReplaceTempView("silver_loan_snapshot")
     return df
+
+
+@pytest.fixture
+def restores_the_silver_views(spark, silver):
+    """Let one test replace the silver temp views, then put them back.
+
+    `SNAPSHOT_SQL` reads views by fixed name, so a test that needs a hand-built
+    book of its own has no choice but to clobber the session-scoped ones. If it
+    does not restore them, every later test that re-runs the snapshot query
+    silently reads the three-row fixture instead of the generated book -- which
+    is precisely what happened the first time this was written, and it surfaced
+    as a reproducibility failure in a completely unrelated test.
+    """
+    yield
+    frames, _ = silver
+    for entity, df in frames.items():
+        df.createOrReplaceTempView(f"silver_{entity}")
+    SN.month_ends(spark, "2024-09-30", REPORTING_DATE).createOrReplaceTempView(
+        "snapshot_dates")
 
 
 # ---------------------------------------------------------------------------
@@ -136,18 +155,119 @@ def test_warnings_ride_along_rather_than_removing_the_row(silver):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_dpd_and_classification_agree(snapshot):
-    """SMA staging must be a pure function of DPD, with no overlap or gap."""
+def test_snapshot_classification_partitions_dpd_with_no_gap_or_overlap(snapshot):
+    """Classification is a pure function of DPD and the threshold in force.
+
+    SMA bands are the single-column NBFC table at para 18 of the RBI (NBFC -
+    Resolution of Stressed Assets) Directions, 2025: up to 30 days, more than 30
+    and up to 60, more than 60 and up to 90.
+
+    NPA is compared against `npa_dpd_threshold` rather than a literal 90,
+    because for a Base Layer NBFC that threshold moved: 150 days from 31 Mar
+    2024, 120 from 31 Mar 2025, 90 from 31 Mar 2026 (IRACP Directions, 2025,
+    paras 43-44). NPA is tested before the SMA bands, so an account past the
+    threshold is an NPA regardless of where it falls in the SMA table.
+    """
     mismatches = snapshot.filter("""
         NOT (
-            (dpd = 0                  AND asset_classification = 'STANDARD') OR
-            (dpd BETWEEN 1  AND 30    AND asset_classification = 'SMA-0')    OR
-            (dpd BETWEEN 31 AND 60    AND asset_classification = 'SMA-1')    OR
-            (dpd BETWEEN 61 AND 90    AND asset_classification = 'SMA-2')    OR
-            (dpd > 90                 AND asset_classification = 'NPA')
+            (dpd = 0                               AND asset_classification = 'STANDARD') OR
+            (dpd BETWEEN 1 AND 30                  AND asset_classification = 'SMA-0')    OR
+            (dpd BETWEEN 31 AND 60                 AND asset_classification = 'SMA-1')    OR
+            (dpd > 60 AND dpd <= npa_dpd_threshold AND asset_classification = 'SMA-2')    OR
+            (dpd > npa_dpd_threshold               AND asset_classification = 'NPA')
         )
     """)
     assert mismatches.count() == 0
+    assert snapshot.filter("asset_classification = 'SMA-0'").count() > 0
+
+
+def test_the_npa_threshold_follows_the_base_layer_glide_path(snapshot):
+    """The threshold in force has to move with the calendar, not with today.
+
+    A synthetic book spanning 2024 to 2026 that stamps NPA at 90 days throughout
+    is applying a rule that had not yet come into force for a Base Layer NBFC
+    over most of its own window. This asserts the three steps actually appear in
+    the snapshot, keyed off the snapshot date rather than the run date.
+    """
+    by_date = {r["snapshot_date"]: r["npa_dpd_threshold"]
+               for r in snapshot.select("snapshot_date", "npa_dpd_threshold")
+               .distinct().collect()}
+
+    assert by_date[date(2024, 9, 30)] == 150, "150-day norm applied from 31 Mar 2024"
+    assert by_date[date(2025, 3, 31)] == 120, "120-day norm from 31 Mar 2025"
+    assert by_date[date(2026, 2, 28)] == 120, "still 120 the month before the step"
+    assert by_date[date(2026, 3, 31)] == 90, "90-day norm from 31 Mar 2026"
+    assert by_date[date(2026, 8, 31)] == 90
+
+    # And the classification actually uses it: before 31 Mar 2026 there must
+    # exist accounts past 90 DPD that are still not NPA, or the glide path is
+    # being computed and then ignored.
+    lenient = snapshot.filter(
+        "snapshot_date < DATE'2026-03-31' AND dpd > 90 "
+        "AND asset_classification <> 'NPA'")
+    assert lenient.count() > 0, (
+        "no account sits above 90 DPD without being an NPA before the 90-day "
+        "norm applied -- the threshold column is not reaching the CASE")
+
+
+def test_partial_payment_does_not_upgrade_the_account(spark, restores_the_silver_views):
+    """RBI (NBFC - IRACP) Directions, 2025, para 24: upgrade only on full arrears.
+
+        Loan accounts classified as NPAs may be upgraded as 'standard' asset
+        only if entire arrears of interest and principal are paid by the
+        borrower.
+
+    Built as a hand-made three-instalment loan rather than drawn from the
+    generated book, because the property needs a specific shape: instalment one
+    unpaid, instalments two and three settled. A borrower who has paid two of
+    three instalments has paid most of what is owed and is still not standard,
+    and DPD still runs from the *oldest* unpaid due date rather than the most
+    recent one.
+
+    This falls out of the arrears anchor rather than being coded as a rule,
+    which is exactly why it needs a test -- nothing in the SQL says "upgrade",
+    so a well-meaning change from MIN to MAX would silently grant amnesty to
+    every partially-paying account in the book.
+    """
+    spark.createDataFrame(
+        [("L1", "C1", "M1", "NO_COST_EMI", 3000.0, 3, date(2026, 1, 15))],
+        "loan_id string, customer_id string, merchant_id string, product string, "
+        "principal double, tenure_months int, disbursed_at date",
+    ).createOrReplaceTempView("silver_loans")
+
+    spark.createDataFrame(
+        [("L1", 1, date(2026, 2, 15), 1000.0, 1000.0),
+         ("L1", 2, date(2026, 3, 15), 1000.0, 1000.0),
+         ("L1", 3, date(2026, 4, 15), 1000.0, 1000.0)],
+        "loan_id string, instalment_no int, due_date date, emi_amount double, "
+        "principal_component double",
+    ).createOrReplaceTempView("silver_emi_schedule")
+
+    # Instalments 2 and 3 settled on time. Instalment 1 never paid.
+    spark.createDataFrame(
+        [("A2", "L1", 2, date(2026, 3, 15), 1000.0, "SUCCESS", date(2026, 3, 15)),
+         ("A3", "L1", 3, date(2026, 4, 15), 1000.0, "SUCCESS", date(2026, 4, 15))],
+        "attempt_id string, loan_id string, instalment_no int, due_date date, "
+        "amount double, status string, paid_at date",
+    ).createOrReplaceTempView("silver_repayment_attempts")
+
+    SN.month_ends(spark, "2026-02-28", "2026-06-30").createOrReplaceTempView(
+        "snapshot_dates")
+    rows = {r["snapshot_date"]: r
+            for r in spark.sql(SN.snapshot_sql(180)).collect()}
+
+    # 31 May: instalment 1 is 105 days overdue even though two later
+    # instalments have been settled in full.
+    may = rows[date(2026, 5, 31)]
+    assert may["oldest_unpaid_due"] == date(2026, 2, 15)
+    assert may["dpd"] == 105
+    assert may["asset_classification"] == "NPA"
+
+    # And it does not drift back down the ladder as later instalments settle.
+    for snap in (date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30)):
+        assert rows[snap]["oldest_unpaid_due"] == date(2026, 2, 15), (
+            f"{snap}: the arrears anchor moved off the oldest unpaid instalment, "
+            f"which would upgrade an account that has not cleared its arrears")
 
 
 def test_snapshot_is_reproducible_for_a_historical_date(spark, snapshot):
@@ -162,7 +282,7 @@ def test_snapshot_is_reproducible_for_a_historical_date(spark, snapshot):
                 .collect()[0])
 
     first = measure(snapshot)
-    again = measure(spark.sql(SN.SNAPSHOT_SQL.format(write_off_dpd=180)))
+    again = measure(spark.sql(SN.snapshot_sql(180)))
 
     assert first["os"] == pytest.approx(again["os"], rel=1e-9)
     assert first["npa_loans"] == again["npa_loans"]
@@ -231,7 +351,7 @@ def test_gold_gnpa_matches_the_independent_backtest(spark, snapshot, raw_views):
 
 
 def test_ecl_staging_partitions_the_book_exactly_once(spark, snapshot):
-    """Every live loan lands in exactly one IND-AS 109 stage, and the exposures
+    """Every live loan lands in exactly one Ind AS 109 stage, and the exposures
     reconcile back to the portfolio total. A staging rule with a gap or an
     overlap silently under- or over-provisions."""
     G.ecl_parameters(spark).createOrReplaceTempView("ecl_parameters")
