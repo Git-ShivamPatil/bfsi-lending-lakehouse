@@ -132,9 +132,18 @@ token and no account console. Total execution 230 seconds across the four tasks:
 | snapshot | 2 s | 16 s | 902,567 loan-date rows |
 | gold | 1 s | 63 s | eleven tables |
 
-Every count is identical to the notebook run above. That is now three independent
-paths to the same numbers — a notebook, a deployed job, and a pure-Python
-back-test — which is the only reason any of them is worth quoting.
+It also runs from the workspace UI, not only from the CLI: **Run now** on the job
+page triggers it (`Launched: Manually`), and the four tasks go green in the same
+order. The UI recognises it as bundle-managed rather than a hand-built job —
+*Connected to Declarative Automation Bundles* — and each task shows it executing
+`.bundle/bfsi-lending-lakehouse/dev/files/jobs/run_stage.py`, which is the
+deployed copy rather than anything in a notebook. That run read 30,857,411 rows
+and wrote 5,825,323 across 64 queries.
+
+Every count is identical to the notebook run above, and to the UI-triggered run.
+That is four independent paths to the same numbers — a notebook, a job triggered
+from the CLI, the same job triggered from the UI, and a pure-Python back-test on
+a laptop — which is the only reason any of them is worth quoting.
 
 ---
 
