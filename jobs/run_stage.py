@@ -23,10 +23,50 @@ import argparse
 import sys
 from pathlib import Path
 
+
+def _repo_root() -> Path:
+    """Locate the repository root without relying on `__file__`.
+
+    A serverless `spark_python_task` does not run this file as a script. There is
+    no `__main__` module and no `runpy`: the platform reads the bytes and
+    evaluates them inside an ipykernel command namespace, roughly
+
+        with open(filename, "rb") as f:
+            exec(compile(f.read(), filename, 'exec'))
+
+    and `exec` of a code object binds no `__file__`. Deriving the root from
+    `__file__` therefore worked everywhere except the one place this file exists
+    to serve, and the first deployed run died here with
+
+        NameError: name '__file__' is not defined
+
+    The code object's own `co_filename` is whatever the platform handed to
+    `compile`, which is the absolute `/Workspace/.../jobs/run_stage.py` on a job
+    task and the script path under `python jobs/run_stage.py`. So it survives
+    both paths where `__file__` survives only one.
+
+    The `pipeline` directory is checked rather than assumed: a candidate that
+    resolved against the wrong working directory would otherwise put a plausible
+    but wrong root on `sys.path` and fail later, further from the cause.
+    `tests/test_job_entrypoint.py` reproduces the platform's execution model, so
+    this is regression-tested without needing a Databricks account.
+    """
+    for candidate in (globals().get("__file__"),
+                      sys._getframe().f_code.co_filename):
+        if not candidate or candidate.startswith("<"):
+            continue                      # "<string>", "<stdin>": no file identity
+        root = Path(candidate).resolve().parents[1]
+        if (root / "pipeline").is_dir():
+            return root
+    raise RuntimeError(
+        "cannot locate the repository root: run_stage.py was evaluated with no "
+        "usable file identity, and no candidate parent holds the pipeline package")
+
+
 # Must happen before the pipeline imports below: on Databricks the working
 # directory is the job's, not the repo's, and `pipeline` is only importable once
 # its parent is on the path.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = _repo_root()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -84,5 +124,28 @@ def main(argv=None) -> int:
     return 0
 
 
+def cli(argv=None) -> None:
+    """Run a stage and translate the result into a process exit code.
+
+    `raise SystemExit(main())` is the idiomatic trailer for a script, and it is
+    wrong here. A serverless `spark_python_task` evaluates this file inside an
+    ipykernel command (see `_repo_root`), where `SystemExit` is not a clean exit
+    but an exception that escapes the cell -- so the platform marks the task
+    FAILED on a *successful* run. The first green bronze stage reported all six
+    tables and then failed with
+
+        SystemExit: 0
+        UserWarning: To exit: use 'exit', 'quit', or Ctrl-D.
+
+    Success therefore has to return rather than raise. A non-zero result still
+    raises, because a task that fails must fail: silently returning would hand
+    the platform a green run over a broken stage, which is the worse of the two
+    directions to be wrong in.
+    """
+    code = main(argv)
+    if code:
+        raise SystemExit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    cli()

@@ -33,7 +33,7 @@ Being straight about this matters more than the claim it costs me:
 | Medallion pipeline (bronze → gold) | Verified in CI on PySpark **3.5.3 and 4.2.0** |
 | Incremental `MERGE INTO`, Delta time travel | Verified in CI (needs a Delta runtime) |
 | Databricks Free Edition | **Run end to end on 2026-09-06**, from a Git folder, on serverless. Figures below. |
-| The deployment bundle | Schema-valid and serverless-clean in CI on every push. **Not yet deployed** — see the caveat below. |
+| The deployment bundle | Schema-valid in CI on every push, and **deployed and run green on 2026-09-06** — four tasks, bronze → gold, all SUCCESS. |
 
 **What the Databricks run produced.** [`notebooks/run_pipeline.py`](notebooks/run_pipeline.py)
 executed top to bottom against `workspace.default`: the generator on the driver
@@ -74,8 +74,9 @@ identical, and should not be: Spark reports on the 149,202 loans that survived
 the rule repository, the back-test on all 150,000 raw rows minus the ones its own
 cleaning drops. The gap *is* the quarantine, and it is 8 basis points wide.
 
-**Four things broke on the way**, none of which CI could have caught, because
-CI runs open-source Spark on a local master where all four work:
+**Six things broke on the way.** The first four could not have been caught by
+CI, because CI runs open-source Spark on a local master where all four work. The
+last two could have been, and now are — see the note after the list:
 
 - `clean.py` cached the cleaned frame. The DataFrame and SQL caching APIs raise
   on serverless compute, which is all Free Edition has — so the pipeline as
@@ -92,12 +93,48 @@ CI runs open-source Spark on a local master where all four work:
   green run against stale code**, because the notebook session still held the
   previously imported modules. Nothing failed; the numbers were simply the
   previous run's. See [the note under Run it](#on-databricks-free-edition).
+- The first deployed job task died with `NameError: name '__file__' is not
+  defined`. A serverless `spark_python_task` does not run the file as a script —
+  there is no `__main__` module and no `runpy`. The platform reads the bytes and
+  evaluates them inside an ipykernel command, and `exec` of a code object binds
+  no `__file__`. So the one thing [`jobs/run_stage.py`](jobs/run_stage.py) exists
+  to do — put the repository root on `sys.path` — was the thing that failed. The
+  code object's own `co_filename` survives both worlds and is used instead.
+- With that fixed, bronze ran, printed all six table counts, and was still
+  recorded as **FAILED** — on `SystemExit: 0`. `raise SystemExit(main())` is the
+  idiomatic trailer for a script and is wrong inside a cell, where `SystemExit`
+  is not a clean exit but an exception that escapes. Success now returns; only a
+  non-zero result raises.
 
-**What is still not proven.** The bundle in [`databricks.yml`](databricks.yml)
-has never been deployed — it is checked against the CLI's own JSON schema on
-every push, which catches a malformed task or a cluster block serverless would
-reject, but schema-valid is not deployable. The runs above were driven from a
-Git folder and a notebook, not from `databricks bundle deploy`.
+Those last two are the first platform bugs in this project that a laptop can
+reproduce, because the execution model is three lines:
+
+```python
+exec(compile(src, path, "exec"), {"__name__": "not_main", "__builtins__": __builtins__})
+```
+
+[`tests/test_job_entrypoint.py`](tests/test_job_entrypoint.py) does exactly that
+and reproduces both failures in under a second with no Databricks account. It
+exists because the deeper problem was not either bug: it was that the bundle was
+schema-checked on every push while the entrypoint it points at had **no test
+coverage at all**, having only ever run on the platform.
+
+**The bundle is deployed, and the job runs green.** `databricks bundle deploy`
+put the four-task job into the workspace, and `databricks bundle run` took it
+bronze → silver → snapshot → gold with every task SUCCESS. Authentication is
+`databricks auth login` — OAuth U2M, one browser consent, no personal access
+token and no account console. Total execution 230 seconds across the four tasks:
+
+| Task | Setup | Execution | Produced |
+|---|---:|---:|---|
+| bronze | 4 s | 88 s | six tables, 822,886 attempts |
+| silver | 1 s | 63 s | 149,202 loans kept, 21,197 quarantined |
+| snapshot | 2 s | 16 s | 902,567 loan-date rows |
+| gold | 1 s | 63 s | eleven tables |
+
+Every count is identical to the notebook run above. That is now three independent
+paths to the same numbers — a notebook, a deployed job, and a pure-Python
+back-test — which is the only reason any of them is worth quoting.
 
 ---
 
@@ -544,9 +581,24 @@ generator sidesteps by having no third-party dependencies at all.
 
 To drive it from CI instead, [`.github/workflows/databricks.yml`](.github/workflows/databricks.yml)
 generates the book on a runner and pushes it into the volume through the Files
-API. That path needs a personal access token in repository secrets, because
+API. Deploying by hand needs no token — `databricks auth login` does OAuth
+U2M through the browser, which is how the bundle above was deployed. Only the
+unattended CI path needs a personal access token in repository secrets, because
 Free Edition has no account console and therefore no service principals and no
 OAuth machine-to-machine.
+
+Or deploy the bundle and let the job run the four stages in order:
+
+```bash
+databricks auth login --host https://<workspace>.cloud.databricks.com --profile bfsi
+databricks bundle validate -t dev -p bfsi
+databricks bundle deploy   -t dev -p bfsi
+databricks bundle run medallion -t dev -p bfsi
+```
+
+`bundle validate` against a live workspace is a materially stronger check than
+the offline `bundle schema` one CI runs, and it is worth doing before the deploy
+rather than after.
 
 Or run the stages directly, which is what the job tasks do:
 
@@ -687,9 +739,11 @@ lending data is used, and none of it is scraped from anywhere.
   distribution, so the reason does not vary by bureau band the way it would if
   a real rule engine had emitted it. The approval *rate* varies by band; the
   reason for a given decline does not.
-- **The bundle has never been deployed.** It is schema-checked on every push
-  and it is written to the serverless constraints, but the end-to-end run went
-  through a Git folder and a notebook.
+- **The job runs on data the generator already put there.** The deployed job
+  starts at bronze and reads the landing volume; nothing in the job graph
+  generates the book or pushes it. Populating the volume is still a notebook cell
+  or the Files API workflow, so the bundle is a *pipeline* deployment rather than
+  an end-to-end one.
 - **Several segment cuts have no statistical power.** The configured city-tier
   risk gradient is 14%, and at 150k loans that is about two standard errors —
   the observed ordering does not match the configured one. Any conclusion drawn

@@ -13,10 +13,15 @@
 #   * `workspace.default` rather than a catalog of our own, because CREATE
 #     CATALOG has a reported failure mode on Free Edition.
 #
-# The host and token come from DATABRICKS_HOST / DATABRICKS_TOKEN in the
-# environment, so nothing secret is committed. Free Edition has no account
-# console, which means no service principals and no OAuth M2M -- a personal
-# access token is the only auth path that works.
+# Nothing secret is committed. Deploying interactively needs no token at all:
+# `databricks auth login --host <workspace>` runs OAuth U2M, the browser asks for
+# consent once, and `databricks bundle deploy -t dev` works from there. That is
+# how this bundle was actually deployed.
+#
+# A personal access token in DATABRICKS_HOST / DATABRICKS_TOKEN is only needed
+# for the *headless* path, because Free Edition has no account console and
+# therefore no service principals and no OAuth M2M -- so CI has nothing to
+# authenticate as.
 
 bundle:
   name: bfsi-lending-lakehouse
