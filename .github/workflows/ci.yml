@@ -138,3 +138,37 @@ jobs:
 
           print(f"{len(ids)} rules across {len(R.entities())} entities: OK")
           PY
+
+  airflow:
+    name: Airflow DAG matches the Databricks bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # Airflow is not a dependency of the pipeline -- it is one of two ways to
+      # schedule it -- so it is installed only in this job. The constraints file
+      # is not optional: Airflow pins a large transitive tree and an unconstrained
+      # install resolves to a combination upstream never tested.
+      - name: Install Airflow
+        run: |
+          AIRFLOW_VERSION=2.10.5
+          PYTHON_VERSION=3.11
+          pip install "apache-airflow==${AIRFLOW_VERSION}" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+          pip install pytest pyyaml
+
+      # The DAG and resources/medallion.job.yml describe one pipeline. This
+      # asserts they still describe the SAME one: same task keys, same edges.
+      # Without it, renaming a stage in the bundle leaves Airflow running the
+      # old graph -- green in the UI, and gold reporting the wrong day.
+      # The tests skip themselves when Airflow is absent, which is right locally
+      # and wrong here: a broken install would turn this job green by running
+      # nothing. Fail before pytest is reached instead.
+      - name: Airflow is genuinely installed
+        run: python -c "import airflow, pendulum; print('airflow', airflow.__version__)"
+
+      - name: DAG imports and matches the bundle
+        run: python -m pytest tests/test_airflow_dag.py -v -rs
